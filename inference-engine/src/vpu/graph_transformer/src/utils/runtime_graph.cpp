@@ -251,7 +251,7 @@ std::map<std::string, std::string> extractMeta(const StageMetaInfo& stageMeta) {
         outPrecisionsStr += ',' + std::string(outPrecision.name());
     }
     serializationInfo[ExecGraphInfoSerialization::OUTPUT_PRECISIONS] = outPrecisionsStr;
-
+    serializationInfo[ExecGraphInfoSerialization::RUNTIME_PRECISIONS] = outPrecisionsStr;
     return serializationInfo;
 }
 
