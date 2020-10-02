@@ -17,13 +17,14 @@
 #include <samples/common.hpp>
 #include <samples/slog.hpp>
 #include <samples/args_helper.hpp>
-#include "/home/akorolev/work/code/openvino/ngraph/core/include/ngraph/function.hpp"
+#include <ngraph/function.hpp>
 
+#include "../../src/plugin_api/exec_graph_info.hpp"
 #include "benchmark_app.hpp"
 #include "infer_request_wrap.hpp"
+#include "inputs_filling.hpp"
 #include "progress_bar.hpp"
 #include "statistics_report.hpp"
-#include "inputs_filling.hpp"
 #include "utils.hpp"
 
 using namespace InferenceEngine;
@@ -621,9 +622,10 @@ int main(int argc, char *argv[]) {
         }
         auto execGraphInfo = exeNetwork.GetExecGraphInfo();
         auto graph = execGraphInfo.getFunction();
-        auto nodes = graph.get()->get_ops();
+        auto nodes = graph->get_ops();
         for (const auto& node : nodes) {
-                node->
+            std::cout << "NODE INFO: " <<
+                node->get_rt_info()[ExecGraphInfoSerialization::RUNTIME_PRECISIONS] << std::endl;
         }
 
         if (perf_counts) {
