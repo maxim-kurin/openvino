@@ -17,6 +17,7 @@
 #include <samples/common.hpp>
 #include <samples/slog.hpp>
 #include <samples/args_helper.hpp>
+#include "/home/akorolev/work/code/openvino/ngraph/core/include/ngraph/function.hpp"
 
 #include "benchmark_app.hpp"
 #include "infer_request_wrap.hpp"
@@ -617,6 +618,12 @@ int main(int argc, char *argv[]) {
             } catch (const std::exception & ex) {
                 slog::err << "Can't get executable graph: " << ex.what() << slog::endl;
             }
+        }
+        auto execGraphInfo = exeNetwork.GetExecGraphInfo();
+        auto graph = execGraphInfo.getFunction();
+        auto nodes = graph.get()->get_ops();
+        for (const auto& node : nodes) {
+                node->
         }
 
         if (perf_counts) {
