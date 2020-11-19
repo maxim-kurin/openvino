@@ -45,6 +45,7 @@ public:
     void GetPerformanceCounts(std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> &perfMap) const override;
 
     void updateInOutIfNeeded();
+    void updateOutputs();
 
     SubRequestsList _inferRequests;
     std::map<std::string, InferenceEngine::Blob::Ptr>   _blobs;

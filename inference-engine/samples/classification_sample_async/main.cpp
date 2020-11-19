@@ -48,8 +48,8 @@ void assignAffinities(InferenceEngine::CNNNetwork & network, InferenceEngine::Co
         throw std::logic_error("There is not devices of specified type. Please, specify device type like MYRIAD, FPGA, etcc");
     }
 
-    std::string particularDevice1 = "CPU";
-    std::string particularDevice2 = "HDDL2";
+    std::string particularDevice1 = "VPUX";
+    std::string particularDevice2 = "CPU";
 
     std::string heteroDevice = "HETERO:" + particularDevice1;
     std::string particularDevice = particularDevice1;
@@ -59,17 +59,29 @@ void assignAffinities(InferenceEngine::CNNNetwork & network, InferenceEngine::Co
     std::cout << "Manual distribution logic is used" << std::endl;
     auto ngraphFunction = network.getFunction();
     auto orderedOps = ngraphFunction->get_ordered_ops();
-    const std::string layerToCut = "prob";
 
-    for (auto&& node : orderedOps) {
-        auto& nodeInfo = node->get_rt_info();
+    const std::string layerToCut = "InceptionV1/Logits/Predictions/Softmax";
+//    const std::string layerToCut = "InceptionV1/InceptionV1/Mixed_5c/concat_v2";
+
+    for (auto &&node : orderedOps) {
+        auto &nodeInfo = node->get_rt_info();
         if (layerToCut == node->get_friendly_name()) {
-            std::cout << "===== layer will be set to HDDL" << '\n';
+            std::cout << "===== layer will be set to " << particularDevice2 << '\n';
             particularDevice = particularDevice2;
             heteroDevice += "," + particularDevice;
+
+            // reassign affinities for constants that are used in "cut" layer
+            for (std::size_t i = 0; i < node->get_input_size(); i++) {
+                auto input = node->get_input_node_ptr(i);
+                if (ngraph::op::is_constant(input)) {
+                    std::cout << "Reassigning " << input->get_friendly_name() << " to " << particularDevice2 << '\n';
+                    input->get_rt_info()["affinity"] =
+                        std::make_shared<ngraph::VariantWrapper<std::string>>(particularDevice2);
+                }
+            }
         }
-        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>> (particularDevice);
-        std::cout << particularDevice << " | " << node->get_name() << " | " <<  node->get_friendly_name() << '\n';
+        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>(particularDevice);
+        std::cout << particularDevice << " | " << node->get_name() << " | " << node->get_friendly_name() << '\n';
     }
 
     std::cout << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << std::endl;
@@ -164,7 +176,7 @@ int main(int argc, char *argv[]) {
         /** Specifying the precision and layout of input data provided by the user.
          * This should be called before load of the network to the device **/
         inputInfoItem.second->setPrecision(Precision::U8);
-        inputInfoItem.second->setLayout(Layout::NCHW);
+        inputInfoItem.second->setLayout(Layout::NHWC);
 
         std::vector<std::shared_ptr<unsigned char>> imagesData = {};
         std::vector<std::string> validImageNames = {};

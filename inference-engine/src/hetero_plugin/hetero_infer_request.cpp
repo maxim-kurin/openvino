@@ -88,13 +88,13 @@ void HeteroInferRequest::SetBlob(const char* name, const InferenceEngine::Blob::
 
 void HeteroInferRequest::InferImpl() {
     updateInOutIfNeeded();
-    size_t i = 0;
     for (auto &&desc : _inferRequests) {
         OV_ITT_SCOPED_TASK(itt::domains::HeteroPlugin, desc._profilingTask);
         auto &r = desc._request;
         assert(nullptr != r);
         r->Infer();
     }
+    // updateOutputs();
 }
 
 void HeteroInferRequest::GetPerformanceCounts(std::map<std::string, InferenceEngineProfileInfo> &perfMap) const {
@@ -139,6 +139,23 @@ void HeteroInferRequest::updateInOutIfNeeded() {
                     r->SetBlob(ioname.c_str(), ito->second);
                     _blobs[ioname] = ito->second;
                 }
+            }
+        }
+    }
+}
+
+void HeteroInferRequest::updateOutputs() {
+    OV_ITT_SCOPED_TASK(itt::domains::HeteroPlugin, "updateOutputs");
+    assert(!_inferRequests.empty());
+
+    for (auto &desc : _inferRequests) {
+        const auto outputsInfo = desc._network.GetOutputsInfo();
+        for (auto& output : _outputs) {
+            auto& name = output.first;
+            auto outputInfo = outputsInfo.find(name);
+            if (outputInfo != std::end(outputsInfo)) {
+                output.second = desc._request->GetBlob(name);
+                _blobs[output.first] = output.second;
             }
         }
     }
