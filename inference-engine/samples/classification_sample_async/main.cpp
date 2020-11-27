@@ -29,7 +29,102 @@
 
 #include "classification_sample_async.h"
 
+#include <hetero/hetero_plugin_config.hpp>
+#include <ngraph/ngraph.hpp>
+#include <ngraph/op/util/op_types.hpp>
+#include <ngraph/ops.hpp>
+#include <ngraph/variant.hpp>
+#include <ngraph/opsets/opset1.hpp>
+
 using namespace InferenceEngine;
+
+void insert_noop_reshape_after(std::shared_ptr<ngraph::Node>& node, const std::string& opName) {
+    // Get all consumers for node
+    auto consumers = node->output(0).get_target_inputs();
+
+    const auto shape = node->get_shape();
+
+    // Create noop transpose node
+    auto constant = std::make_shared<ngraph::op::Constant>(
+                ngraph::element::i64, ngraph::Shape{shape.size()}, std::vector<size_t>{0, 1, 2, 3});
+    constant->set_friendly_name(opName + "_const");
+    constant->get_rt_info()["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>("VPUX");
+
+    auto transpose = std::make_shared<ngraph::opset1::Transpose>(node, constant);
+    transpose->set_friendly_name(opName);
+    transpose->get_rt_info()["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>("VPUX");
+
+    // Create noop reshape node
+//    auto constant = std::make_shared<ngraph::op::Constant>(
+//                ngraph::element::i64, ngraph::Shape{shape.size()}, shape);
+//    constant->set_friendly_name(opName + "_const");
+//    constant->get_rt_info()["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>("VPUX");
+//
+//    auto transpose = std::make_shared<ngraph::opset1::Reshape>(node, constant, false);
+//    transpose->set_friendly_name(opName);
+//    transpose->get_rt_info()["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>("VPUX");
+
+    // Reconnect all consumers to new_node
+    for (auto input : consumers) {
+        input.replace_source_output(transpose);
+    }
+}
+
+void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Core& core, std::string& heteroDevice) {
+    std::vector<std::string> availableDevices = core.GetMetric("CPU", Metrics::METRIC_AVAILABLE_DEVICES);
+
+    // check that provided devices are available
+    if (availableDevices.empty()) {
+        throw std::logic_error("There is not devices of specified type. Please, specify device type like MYRIAD, FPGA, etcc");
+    }
+
+    std::string particularDevice1 = "VPUX";
+    std::string particularDevice2 = "CPU";
+
+    std::string particularDevice = particularDevice1;
+
+    heteroDevice = "HETERO:" + particularDevice;
+
+    std::cout << "Manual distribution logic is used" << std::endl;
+    auto ngraphFunction = network.getFunction();
+    auto orderedOps = ngraphFunction->get_ordered_ops();
+
+    const auto layerToCut = [&]() -> std::string {
+        const std::string layerToCut = "InceptionV3/InceptionV3/Mixed_7a/concat_v2";
+//        const std::string layerToCut = "conv1_1/WithoutBiases";
+        if (particularDevice != "VPUX") {
+            return layerToCut;
+        }
+
+        // with VPUX plugin, also add temporary SW layer at the end of the subnetwork
+        for (auto &&node : orderedOps) {
+            if (layerToCut == node->get_friendly_name()) {
+                auto opName = std::string{"last_reshape_layer"};
+                insert_noop_reshape_after(node, opName);
+                return opName;
+            }
+        }
+
+        std::cout << "Splitting layer \"" << layerToCut << "\" was not found." << std::endl;
+        return {};
+    }();
+
+    orderedOps = ngraphFunction->get_ordered_ops();
+
+    for (auto &&node : orderedOps) {
+        auto &nodeInfo = node->get_rt_info();
+        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>(particularDevice);
+        std::cout << particularDevice << " | " << node->get_name() << " | " << node->get_friendly_name() << '\n';
+
+        if (layerToCut == node->get_friendly_name()) {
+            std::cout << "================ CUTTING POINT ================\n";
+            particularDevice = particularDevice2;
+            heteroDevice += "," + particularDevice;
+        }
+    }
+
+    std::cout << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << std::endl;
+}
 
 bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     // ---------------------------Parsing and validation of input args--------------------------------------
@@ -95,6 +190,9 @@ int main(int argc, char *argv[]) {
 
         /** Read network model **/
         CNNNetwork network = ie.ReadNetwork(FLAGS_m);
+
+        assignAffinities(network, ie, FLAGS_d);
+
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 3. Configure input & output ---------------------------------------------
@@ -111,7 +209,7 @@ int main(int argc, char *argv[]) {
         /** Specifying the precision and layout of input data provided by the user.
          * This should be called before load of the network to the device **/
         inputInfoItem.second->setPrecision(Precision::U8);
-        inputInfoItem.second->setLayout(Layout::NCHW);
+        inputInfoItem.second->setLayout(Layout::NHWC);
 
         std::vector<std::shared_ptr<unsigned char>> imagesData = {};
         std::vector<std::string> validImageNames = {};
@@ -150,30 +248,38 @@ int main(int argc, char *argv[]) {
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 6. Prepare input --------------------------------------------------------
-        for (auto & item : inputInfo) {
-            Blob::Ptr inputBlob = inferRequest.GetBlob(item.first);
-            SizeVector dims = inputBlob->getTensorDesc().getDims();
-            /** Fill input tensor with images. First b channel, then g and r channels **/
-            size_t num_channels = dims[1];
-            size_t image_size = dims[3] * dims[2];
 
-            MemoryBlob::Ptr minput = as<MemoryBlob>(inputBlob);
-            if (!minput) {
-                slog::err << "We expect MemoryBlob from inferRequest, but by fact we were not able to cast inputBlob to MemoryBlob" << slog::endl;
-                return 1;
-            }
-            // locked memory holder should be alive all time while access to its buffer happens
-            auto minputHolder = minput->wmap();
+        Blob::Ptr inputBlob = inferRequest.GetBlob(inputInfoItem.first);
+        SizeVector dims = inputBlob->getTensorDesc().getDims();
+        /** Fill input tensor with images. First b channel, then g and r channels **/
+        size_t C = dims[1];
+        size_t H = dims[2];
+        size_t W = dims[3];
 
-            auto data = minputHolder.as<PrecisionTrait<Precision::U8>::value_type *>();
-            /** Iterate over all input images **/
-            for (size_t image_id = 0; image_id < imagesData.size(); ++image_id) {
-                /** Iterate over all pixel in image (b,g,r) **/
-                for (size_t pid = 0; pid < image_size; pid++) {
-                    /** Iterate over all channels **/
-                    for (size_t ch = 0; ch < num_channels; ++ch) {
-                        /**          [images stride + channels stride + pixel id ] all in bytes            **/
-                        data[image_id * image_size * num_channels + ch * image_size + pid] = imagesData.at(image_id).get()[pid*num_channels + ch];
+        MemoryBlob::Ptr minput = as<MemoryBlob>(inputBlob);
+        if (!minput) {
+            slog::err << "We expect MemoryBlob from inferRequest, but by fact we were not able to cast inputBlob to MemoryBlob" << slog::endl;
+            return 1;
+        }
+
+        // locked memory holder should be alive all time while access to its buffer happens
+        auto minputHolder = minput->wmap();
+        auto data = minputHolder.as<PrecisionTrait<Precision::U8>::value_type *>();
+
+        // Set RGB or BGR image should be passed to the network
+        const bool isBGR = false;
+
+        /** Iterate over all input images **/
+        for (size_t image_id = 0; image_id < imagesData.size(); ++image_id) {
+            auto image = imagesData.at(image_id).get();
+            for (size_t h = 0; h < H; h++) {
+                for (size_t w = 0; w < W; w++) {
+                    for (size_t c = 0; c < C; ++c) {
+                        if (isBGR) {
+                            data[image_id * H * W * C + c + w * C + h * W * C] = image[c + w * C + h * W * C];
+                        } else {
+                            data[image_id * H * W * C + c + w * C + h * W * C] = image[(C - c - 1) + w * C + h * W * C];
+                        }
                     }
                 }
             }
