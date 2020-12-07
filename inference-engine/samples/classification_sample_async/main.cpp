@@ -79,7 +79,7 @@ void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Cor
     }
 
     std::string particularDevice1 = "VPUX";
-    std::string particularDevice2 = "CPU";
+    std::string particularDevice2 = "VPUX";
 
     std::string particularDevice = particularDevice1;
 
@@ -90,8 +90,7 @@ void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Cor
     auto orderedOps = ngraphFunction->get_ordered_ops();
 
     const auto layerToCut = [&]() -> std::string {
-        const std::string layerToCut = "InceptionV3/InceptionV3/Mixed_7a/concat_v2";
-//        const std::string layerToCut = "conv1_1/WithoutBiases";
+        const std::string layerToCut = "InceptionV1/InceptionV1/MaxPool_2a_3x3/MaxPool";
         if (particularDevice != "VPUX") {
             return layerToCut;
         }
