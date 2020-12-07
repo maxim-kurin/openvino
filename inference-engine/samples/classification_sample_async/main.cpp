@@ -79,7 +79,7 @@ void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Cor
     }
 
     std::string particularDevice1 = "VPUX";
-    std::string particularDevice2 = "VPUX";
+    std::string particularDevice2 = "CPU";
 
     std::string particularDevice = particularDevice1;
 
@@ -90,7 +90,7 @@ void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Cor
     auto orderedOps = ngraphFunction->get_ordered_ops();
 
     const auto layerToCut = [&]() -> std::string {
-        const std::string layerToCut = "InceptionV1/InceptionV1/MaxPool_2a_3x3/MaxPool";
+        const std::string layerToCut = "res3a_branch1/fq_input_0";
         if (particularDevice != "VPUX") {
             return layerToCut;
         }
@@ -238,7 +238,8 @@ int main(int argc, char *argv[]) {
 
         // --------------------------- 4. Loading model to the device ------------------------------------------
         slog::info << "Loading model to the device" << slog::endl;
-        ExecutableNetwork executable_network = ie.LoadNetwork(network, FLAGS_d);
+        ExecutableNetwork executable_network = ie.LoadNetwork(network, FLAGS_d,
+            {{"VPU_COMPILER_REMOVE_PERMUTE_NOOP", "NO"}});
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 5. Create infer request -------------------------------------------------
