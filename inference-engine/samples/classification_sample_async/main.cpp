@@ -70,59 +70,51 @@ void insert_noop_reshape_after(std::shared_ptr<ngraph::Node>& node, const std::s
     }
 }
 
+// Sample function that cuts network in half
 void assignAffinities(InferenceEngine::CNNNetwork& network, InferenceEngine::Core& core, std::string& heteroDevice) {
-    std::vector<std::string> availableDevices = core.GetMetric("CPU", Metrics::METRIC_AVAILABLE_DEVICES);
+    // Split between VPUX and CPU diveces (plugins)
+    std::string firstDevice = "VPUX";
+    std::string secondDevice = "CPU";
+    heteroDevice = "HETERO:" + firstDevice + "," + secondDevice;
 
-    // check that provided devices are available
-    if (availableDevices.empty()) {
-        throw std::logic_error("There is not devices of specified type. Please, specify device type like MYRIAD, FPGA, etcc");
+    // Last layer of the first subgraph
+    auto lastLayerName = std::string{"res3a_branch1/fq_input_0"};
+
+    slog::info << "Manual distribution logic is used\n";
+
+    auto ngraphFunction = network.getFunction();
+
+    auto orderedOps = ngraphFunction->get_ordered_ops();
+    auto lastSubgraphLayer =
+            std::find_if(begin(orderedOps), end(orderedOps), [&](const std::shared_ptr<ngraph::Node>& node) {
+                return lastLayerName == node->get_friendly_name();
+            });
+
+    if (lastSubgraphLayer == end(orderedOps)) {
+        slog::err  << "Splitting layer \"" << lastLayerName << "\" was not found.";
     }
 
-    std::string particularDevice1 = "VPUX";
-    std::string particularDevice2 = "CPU";
-
-    std::string particularDevice = particularDevice1;
-
-    heteroDevice = "HETERO:" + particularDevice;
-
-    std::cout << "Manual distribution logic is used" << std::endl;
-    auto ngraphFunction = network.getFunction();
-    auto orderedOps = ngraphFunction->get_ordered_ops();
-
-    const auto layerToCut = [&]() -> std::string {
-        const std::string layerToCut = "res3a_branch1/fq_input_0";
-        if (particularDevice != "VPUX") {
-            return layerToCut;
-        }
-
-        // with VPUX plugin, also add temporary SW layer at the end of the subnetwork
-        for (auto &&node : orderedOps) {
-            if (layerToCut == node->get_friendly_name()) {
-                auto opName = std::string{"last_reshape_layer"};
-                insert_noop_reshape_after(node, opName);
-                return opName;
-            }
-        }
-
-        std::cout << "Splitting layer \"" << layerToCut << "\" was not found." << std::endl;
-        return {};
-    }();
+    // with VPUX plugin, also add temporary SW layer at the end of the subnetwork
+    if (firstDevice == "VPUX") {
+        lastLayerName = "last_reshape_layer";
+        insert_noop_reshape_after(*lastSubgraphLayer, lastLayerName);
+    }
 
     orderedOps = ngraphFunction->get_ordered_ops();
 
-    for (auto &&node : orderedOps) {
-        auto &nodeInfo = node->get_rt_info();
-        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>(particularDevice);
-        std::cout << particularDevice << " | " << node->get_name() << " | " << node->get_friendly_name() << '\n';
+    auto deviceName = std::string{firstDevice};
+    for (auto&& node : orderedOps) {
+        auto& nodeInfo = node->get_rt_info();
+        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>>(deviceName);
+        slog::info << deviceName << " | " << node->get_name() << " | " << node->get_friendly_name() << '\n';
 
-        if (layerToCut == node->get_friendly_name()) {
-            std::cout << "================ CUTTING POINT ================\n";
-            particularDevice = particularDevice2;
-            heteroDevice += "," + particularDevice;
+        if (lastLayerName == node->get_friendly_name()) {
+            slog::info << "================ CUTTING POINT ================\n";
+            deviceName = secondDevice;
         }
     }
 
-    std::cout << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << std::endl;
+    slog::info << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << slog::endl;
 }
 
 bool ParseAndCheckCommandLine(int argc, char *argv[]) {
@@ -181,7 +173,7 @@ int main(int argc, char *argv[]) {
         }
 
         /** Printing device version **/
-        std::cout << ie.GetVersions(FLAGS_d) << std::endl;
+        slog::info << ie.GetVersions(FLAGS_d) << slog::endl;
         // -----------------------------------------------------------------------------------------------------
 
         // 2. Read a model in OpenVINO Intermediate Representation (.xml and .bin files) or ONNX (.onnx file) format
