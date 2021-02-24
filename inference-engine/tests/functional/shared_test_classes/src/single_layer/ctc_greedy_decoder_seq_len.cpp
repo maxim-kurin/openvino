@@ -52,7 +52,8 @@ void CTCGreedyDecoderSeqLenLayerTest::SetUp() {
              blankIndex,
              mergeRepeated,
              targetDevice) = GetParam();
-
+    inPrc = InferenceEngine::Precision::FP16;
+    outPrc = InferenceEngine::Precision::FP16;
     auto ngDataPrc = FuncTestUtils::PrecisionUtils::convertIE2nGraphPrc(dataPrecision);
     auto ngIdxPrc = FuncTestUtils::PrecisionUtils::convertIE2nGraphPrc(indicesPrecision);
     auto paramsIn = ngraph::builder::makeParams(ngDataPrc, { inputShape });
@@ -88,7 +89,7 @@ void CTCGreedyDecoderSeqLenLayerTest::SetUp() {
 
     ngraph::ResultVector results;
     for (int i = 0; i < ctcGreedyDecoderSeqLen->get_output_size(); i++) {
-        results.push_back(std::make_shared<ngraph::opset1::Result>(ctcGreedyDecoderSeqLen->output(i)));
+        results.push_back(std::make_shared<ngraph::opset6::Result>(ctcGreedyDecoderSeqLen->output(i)));
     }
     function = std::make_shared<ngraph::Function>(results, paramsIn, "CTCGreedyDecoderSeqLen");
 }

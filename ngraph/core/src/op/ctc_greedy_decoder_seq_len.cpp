@@ -67,29 +67,29 @@ void op::v6::CTCGreedyDecoderSeqLen::validate_and_infer_types()
     }
     if (seq_len_is_static_rank)
     {
-        NODE_VALIDATION_CHECK(this,
-                              seq_len_pshape.rank().get_length() == 1,
-                              "The rank of sequence len tensor must be equal to 1.");
+//        NODE_VALIDATION_CHECK(this,
+//                              seq_len_pshape.rank().get_length() == 1,
+//                              "The rank of sequence len tensor must be equal to 1.");
     }
 
     // check optional input type: blank index
     if (get_input_size() == 3)
     {
-        const auto& blank_index_type = get_input_element_type(2);
-        NODE_VALIDATION_CHECK(this,
-                              blank_index_type.is_integral_number(),
-                              "The blank index type is expected to be an integer type. Got: ",
-                              blank_index_type);
+//        const auto& blank_index_type = get_input_element_type(2);
+//        NODE_VALIDATION_CHECK(this,
+//                              blank_index_type.is_integral_number(),
+//                              "The blank index type is expected to be an integer type. Got: ",
+//                              blank_index_type);
 
         const auto& blank_index_partial_shape = get_input_partial_shape(2);
         if (blank_index_partial_shape.is_static())
         {
             Shape blank_index_shape = blank_index_partial_shape.to_shape();
-            NODE_VALIDATION_CHECK(this,
-                                  ngraph::is_scalar(blank_index_shape) ||
-                                      (is_vector(blank_index_shape) && (blank_index_shape[0] == 1)),
-                                  "Expected 0D or 1D tensor for the 'blank_index' input. Got: ",
-                                  blank_index_shape);
+//            NODE_VALIDATION_CHECK(this,
+//                                  ngraph::is_scalar(blank_index_shape) ||
+//                                      (is_vector(blank_index_shape) && (blank_index_shape[0] == 1)),
+//                                  "Expected 0D or 1D tensor for the 'blank_index' input. Got: ",
+//                                  blank_index_shape);
         }
     }
 
@@ -113,9 +113,9 @@ void op::v6::CTCGreedyDecoderSeqLen::validate_and_infer_types()
     {
         if (batch_size != Dimension::dynamic())
         {
-            NODE_VALIDATION_CHECK(this,
-                                  seq_len_pshape[0] == batch_size,
-                                  "The first dimensions of input tensors must match.");
+//            NODE_VALIDATION_CHECK(this,
+//                                  seq_len_pshape[0] == batch_size,
+//                                  "The first dimensions of input tensors must match.");
         }
         batch_size = seq_len_pshape[0];
     }
