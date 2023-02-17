@@ -345,7 +345,6 @@ std::vector<ov::Tensor> SubgraphBaseTest::get_plugin_outputs() {
     }
     auto start_time = std::chrono::system_clock::now();
 
-    infer();
     auto outputs = std::vector<ov::Tensor>{};
     for (const auto& output : function->outputs()) {
         outputs.push_back(inferRequest.get_tensor(output));
