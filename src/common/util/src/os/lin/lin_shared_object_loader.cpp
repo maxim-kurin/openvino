@@ -13,7 +13,7 @@
 namespace ov {
 namespace util {
 std::shared_ptr<void> load_shared_object(const char* path) {
-    auto shared_object = std::shared_ptr<void>{dlopen(path, RTLD_NOW), [](void* shared_object) {
+    auto shared_object = std::shared_ptr<void>{dlopen(path, RTLD_LAZY), [](void* shared_object) {
                                                    if (shared_object != nullptr) {
                                                        if (0 != dlclose(shared_object)) {
                                                            std::cerr << "dlclose failed";
