@@ -270,7 +270,7 @@ function(ov_force_include target scope header_file)
     endif()
 endfunction()
 
-# 
+#
 # ie_python_minimal_api(<target>)
 #
 # Set options to use only Python Limited API

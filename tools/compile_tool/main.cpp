@@ -603,6 +603,7 @@ static std::map<std::string, std::string> parseConfigFile(char comment = '#') {
                 key = option.substr(0, spacePos);
                 value = option.substr(spacePos + 1);
                 config[key] = value;
+                std::cout << key << " : " << value << "\n";
             }
         }
     }

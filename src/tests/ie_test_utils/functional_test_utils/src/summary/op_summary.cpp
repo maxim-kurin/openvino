@@ -235,6 +235,8 @@ void Summary::saveDebugReport(const char* className, const char* opName, unsigne
 #endif  //IE_TEST_DEBUG
 
 void OpSummary::saveReport() {
+    return;
+
     if (isReported) {
         return;
     }

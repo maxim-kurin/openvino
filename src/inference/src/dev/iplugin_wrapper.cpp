@@ -58,7 +58,9 @@ void IPluginWrapper::set_property(const ov::AnyMap& properties) {
 
 ov::Any IPluginWrapper::get_property(const std::string& name, const ov::AnyMap& arguments) const {
     try {
-        return m_old_plugin->GetConfig(name, arguments);
+        auto param = m_old_plugin->GetConfig(name, arguments);
+        param.print(std::cout);
+        return param;
     } catch (...) {
         return m_old_plugin->GetMetric(name, arguments);
     }
