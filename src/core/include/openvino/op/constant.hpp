@@ -538,7 +538,7 @@ private:
         element::Type_t Type,
         class U,
         typename std::enable_if<(Type == element::string) != std::is_same<U, std::string>::value>::type* = nullptr>
-    void cast_vector(std::vector<U>& output, size_t num_elements) const {
+    void cast_vector(std::vector<U>&, size_t) const {
         OPENVINO_THROW("'cast_vector' does not support casting Constant of type ",
                        Type,
                        " into std::vector of ",
@@ -588,7 +588,7 @@ private:
         element::Type_t Type,
         class T,
         typename std::enable_if<(Type == element::string) != std::is_same<T, std::string>::value>::type* = nullptr>
-    void fill_data(const T& value) {
+    void fill_data(const T&) {
         if (Type == element::string) {
             fill_data<element::string, std::string>(std::string());
         }
@@ -648,7 +648,7 @@ private:
         element::Type_t Type,
         typename T,
         typename std::enable_if<(Type == element::string) != std::is_same<T, std::string>::value>::type* = nullptr>
-    void write_buffer(const std::vector<T>& source) {
+    void write_buffer(const std::vector<T>&) {
         if (Type == element::string) {
             fill_data<element::string>(std::string());
         }

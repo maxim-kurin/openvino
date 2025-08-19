@@ -190,7 +190,7 @@ typename T::value_type from_string(const std::string& val, const T&) {
 }
 
 template <typename T>
-auto from_string(const std::string& val) ->
+auto from_string(const std::string&) ->
     typename std::enable_if<!Readable<T>::value && !Istreamable<T>::value && !std::is_same<T, std::string>::value,
                             T>::type {
     OPENVINO_THROW("Could read type without std::istream& operator>>(std::istream&, T)",

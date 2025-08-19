@@ -43,8 +43,8 @@ ov::Tensor ModelRange::generate_input(std::shared_ptr<ov::Node> node, size_t por
 
 void ModelRange::find_mode_ranges(const std::shared_ptr<ov::Model>& model) {
     for (auto param : model->get_parameters()) {
-        std::shared_ptr<ov::test::utils::InputGenerateData> data =
-            std::make_shared<ov::test::utils::InputGenerateData>(ov::test::utils::rangeByType.get_range(param->get_element_type()));
+        std::shared_ptr<ov::test::utils::InputGenerateData> data = std::make_shared<ov::test::utils::InputGenerateData>(
+            ov::test::utils::rangeByType.get_range(param->get_element_type()));
 
         bool range_corrected = true;
         std::queue<std::shared_ptr<ov::Node>> queue;
@@ -81,16 +81,12 @@ void ModelRange::find_mode_ranges(const std::shared_ptr<ov::Model>& model) {
             }
         } catch (const std::exception& ex) {
             (void)ex;
-#ifndef NDEBUG
             std::cout << ex.what() << std::endl;
-#endif
         }
-#ifndef NDEBUG
         std::cout << "RANGE FOR PARAMETER: " << param->get_friendly_name()
                   << "  start from: " << std::to_string(data->start_from) << "  range: " << std::to_string(data->range)
                   << "  resolution: " << std::to_string(data->resolution) << "  seed: " << std::to_string(data->seed)
                   << std::endl;
-#endif
 
         std::string range_id = get_range_id(param);
         node_ranges[range_id] = data;

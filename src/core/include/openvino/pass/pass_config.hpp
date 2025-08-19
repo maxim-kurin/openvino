@@ -81,7 +81,7 @@ public:
         m_callback = callback;
     }
     template <typename... Args>
-    typename std::enable_if<sizeof...(Args) == 0>::type set_callback(const param_callback& callback) {}
+    typename std::enable_if<sizeof...(Args) == 0>::type set_callback(const param_callback&) {}
 
     /// \brief Set callback for particular transformation class types
     ///

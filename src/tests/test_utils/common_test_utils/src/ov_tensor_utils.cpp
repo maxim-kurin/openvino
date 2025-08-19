@@ -450,7 +450,7 @@ public:
                 .append(" shapes.");
             constexpr size_t max_num_to_print = 32;
 #else
-            constexpr size_t max_num_to_print = 1;
+            constexpr size_t max_num_to_print = 64;
 #endif
             size_t i = 0;
             for (; i < incorrect_values_abs.size() && i < max_num_to_print; ++i) {
@@ -589,9 +589,9 @@ void compare(const ov::Tensor& expected,
 
         bool status = error.update(actual_value, expected_value, i);
 #ifdef NDEBUG
-        if (!status && tensor_comparation::equal(topk_threshold, 1.f)) {
-            break;
-        }
+        // if (!status && tensor_comparation::equal(topk_threshold, 1.f)) {
+        //     break;
+        // }
 #endif
     }
     error.check_results();

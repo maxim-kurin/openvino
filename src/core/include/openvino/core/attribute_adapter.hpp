@@ -35,7 +35,7 @@ public:
     /// as_type.
     virtual const DiscreteTypeInfo& get_type_info() const = 0;
     virtual ~ValueAccessor();
-    virtual void set_as_any(const ov::Any& x) {
+    virtual void set_as_any(const ov::Any&) {
         OPENVINO_NOT_IMPLEMENTED;
     }
 };

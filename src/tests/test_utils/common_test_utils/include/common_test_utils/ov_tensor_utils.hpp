@@ -43,7 +43,7 @@ struct InputGenerateData {
         : start_from(_start_from),
           range(_range),
           resolution(_resolution),
-          seed(_seed),
+          seed(rand()),
           input_attribute(_input_attribute) {
         if (ConstRanges::is_defined) {
             auto min_orig = start_from;
