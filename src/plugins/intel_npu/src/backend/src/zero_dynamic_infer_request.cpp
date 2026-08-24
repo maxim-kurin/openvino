@@ -11,10 +11,38 @@
 
 using namespace intel_npu;
 
+namespace {
+
+// The shape a memref describes, as the OpenVINO API spells it.
+ov::Shape get_memref_shape(const IDynamicGraph::MemRefType& memRef) {
+    ov::Shape shape;
+    shape.reserve(static_cast<size_t>(memRef._dimsCount));
+    for (int64_t i = 0; i < memRef._dimsCount; ++i) {
+        shape.push_back(static_cast<size_t>(memRef._sizes[i]));
+    }
+    return shape;
+}
+
+// The smallest shape a buffer of this rank can have: one element per dimension the compiler could not
+// bound. Used only as a placeholder for a buffer whose real extents are not known yet.
+ov::Shape get_minimal_shape(const ov::PartialShape& shape) {
+    OPENVINO_ASSERT(shape.rank().is_static(), "Dynamically ranked tensors are not supported, shape: ", shape);
+
+    ov::Shape minimalShape;
+    minimalShape.reserve(shape.size());
+    for (const auto& dim : shape) {
+        minimalShape.push_back(dim.is_dynamic() ? 1 : static_cast<size_t>(dim.get_length()));
+    }
+    return minimalShape;
+}
+
+}  // namespace
+
 ZeroDynamicInferRequest::ZeroDynamicInferRequest(const std::shared_ptr<ZeroInitStructsHolder>& initStructs,
                                                  const std::shared_ptr<const ICompiledModel>& compiledModel,
                                                  const Config& config)
-    : ZeroInferRequest(initStructs, compiledModel, config) {
+    : ZeroInferRequest(initStructs, compiledModel, config),
+      _predictedOutputShapes(_metadata.outputs.size(), std::nullopt) {
     _logger.setName("ZeroDynamicInferRequest");
 }
 
@@ -176,6 +204,26 @@ std::shared_ptr<ZeroTensor> ZeroDynamicInferRequest::allocate_tensor(
                       _userOutputTensors.at(index)->get_shape().to_string().c_str(),
                       descriptor.shapeFromCompiler.to_string().c_str());
         descriptor.shapeFromCompiler = _userOutputTensors.at(index)->get_shape();
+    } else if (descriptor.shapeFromCompiler.is_dynamic()) {
+        // A dimension the compiler could not bound reports no capacity, so get_max_shape() has nothing to
+        // report either and there is no tensor to take the size from. For an output the shape the network
+        // will produce is predicted from the actual input shapes before the outputs are prepared, so use
+        // that; an input has no equivalent - only the caller knows how large it is.
+        OPENVINO_ASSERT(!isInput,
+                        "No tensor has been set for the entry '",
+                        descriptor.nameFromCompiler,
+                        "', whose shape '",
+                        descriptor.shapeFromCompiler.to_string(),
+                        "' has no upper bound to allocate at");
+
+        // Before the first prediction - get_tensor() called ahead of any inference - allocate the smallest
+        // buffer the rank allows and leave growing it to update_tensor, which runs once the shape is known.
+        const auto allocationShape =
+            _predictedOutputShapes.at(index).value_or(get_minimal_shape(descriptor.shapeFromCompiler));
+        _logger.debug("allocate_tensor - update output descriptor with shape %s instead of %s",
+                      allocationShape.to_string().c_str(),
+                      descriptor.shapeFromCompiler.to_string().c_str());
+        descriptor.shapeFromCompiler = allocationShape;
     }
 
     check_network_precision(descriptor.precision);
@@ -251,10 +299,19 @@ void ZeroDynamicInferRequest::predict_shapes(std::vector<IDynamicGraph::MemRefTy
                 inputPros[i].set(get_tensor_data_ptr(levelZeroTensor), 0, levelZeroTensor);
             } else {
                 // If all tensors are not set, use metadata
+                const auto& shapeFromCompiler = _metadata.inputs.at(i).shapeFromCompiler;
+                // An unbounded dimension has no capacity for get_max_shape() to report, and the shape
+                // prediction reads the input extents, so it cannot fill the gap either.
+                OPENVINO_ASSERT(shapeFromCompiler.is_static(),
+                                "No tensor has been set for the entry '",
+                                _metadata.inputs.at(i).nameFromCompiler,
+                                "', whose shape '",
+                                shapeFromCompiler.to_string(),
+                                "' has no upper bound to infer its extents from");
                 inputPros[i].setArg(nullptr);
                 inputPros[i]._offset = 0;
                 // TODO : BatchSize not checked here
-                inputPros[i].setSize(_metadata.inputs.at(i).shapeFromCompiler.get_max_shape());
+                inputPros[i].setSize(shapeFromCompiler.get_max_shape());
                 inputPros[i].updateStride();
             }
         }
@@ -273,10 +330,15 @@ void ZeroDynamicInferRequest::predict_shapes(std::vector<IDynamicGraph::MemRefTy
                 outputProps[i].set(get_tensor_data_ptr(levelZeroTensor), 0, levelZeroTensor);
             } else {
                 // If all tensors are not set, use metadata
+                const auto& shapeFromCompiler = _metadata.outputs.at(i).shapeFromCompiler;
                 outputProps[i].setArg(nullptr);
                 outputProps[i]._offset = 0;
                 // TODO : BatchSize not checked here
-                outputProps[i].setSize(_metadata.outputs.at(i).shapeFromCompiler.get_max_shape());
+                // The prediction below overwrites every extent, so an output only has to carry its rank
+                // here - which is why an unbounded dimension, with no capacity for get_max_shape() to
+                // report, can be seeded with a single element.
+                outputProps[i].setSize(shapeFromCompiler.is_static() ? shapeFromCompiler.get_max_shape()
+                                                                     : get_minimal_shape(shapeFromCompiler));
                 outputProps[i].updateStride();
             }
         }
@@ -284,6 +346,12 @@ void ZeroDynamicInferRequest::predict_shapes(std::vector<IDynamicGraph::MemRefTy
         auto originalOutputProps = outputProps;
 
         dynamicGraph->predict_output_shape(binding, inputPros, outputProps);
+
+        // Remember the prediction: it is the only statement of how large a buffer an output whose shape
+        // the compiler could not bound needs, and allocate_tensor runs after this.
+        for (size_t i = 0; i < outputProps.size(); i++) {
+            _predictedOutputShapes.at(i) = get_memref_shape(outputProps[i]);
+        }
 
         for (size_t i = 0; i < outputProps.size(); i++) {
             if (!originalOutputProps[i].compare(outputProps[i])) {
@@ -314,10 +382,7 @@ void ZeroDynamicInferRequest::check_tensor_and_predicted_shapes(
             continue;
         }
 
-        ov::Shape predictedShape;
-        for (int64_t j = 0; j < outputProps[i]._dimsCount; j++) {
-            predictedShape.push_back(outputProps[i]._sizes[j]);
-        }
+        const auto predictedShape = get_memref_shape(outputProps[i]);
         if (userTensor != nullptr) {
             // User set output tensor, need check size and throw exception if not large enough
             if (shape_size(userTensor->get_shape()) < shape_size(predictedShape)) {
@@ -352,10 +417,7 @@ void ZeroDynamicInferRequest::update_tensor(const std::vector<IDynamicGraph::Mem
                 // Do not need to update user output tensor
                 continue;
             }
-            ov::Shape predictedShape;
-            for (int64_t j = 0; j < outputProps[i]._dimsCount; j++) {
-                predictedShape.push_back(outputProps[i]._sizes[j]);
-            }
+            const auto predictedShape = get_memref_shape(outputProps[i]);
             if (levelZeroTensor->get_shape() != predictedShape) {
                 _logger.info("update_tensor - reshape output tensor %d from %s to predicted shape %s",
                              i,

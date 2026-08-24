@@ -4,8 +4,11 @@
 
 #include "dynamic_graph.hpp"
 
+#include <cstdint>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <vector>
 
 #include "compiler_impl.hpp"
 #include "intel_npu/common/compiler_adapter_factory.hpp"
@@ -18,6 +21,30 @@
 #include "openvino/runtime/make_tensor.hpp"
 
 namespace intel_npu {
+
+namespace {
+
+// A dimension the compiler could not put an upper bound on is reported as the maximum of the field, the
+// same way the argument metadata spells a dynamic dimension with uint64_t. It carries no capacity, so it
+// has to stay dynamic: sizing the buffer is left to whoever binds the tensor.
+constexpr uint32_t UNBOUNDED_DIM = std::numeric_limits<uint32_t>::max();
+
+// Seeds the extents of a binding entry. The binding only has to carry the rank until the tensors are
+// bound - every extent is overwritten from the tensor being bound, or from the predicted output shape,
+// before the first inference. An unbounded dimension has nothing to seed it with: get_shape() would
+// refuse the shape outright and get_max_shape() would report INT64_MAX, which is not a size either.
+std::vector<int64_t> getBindingExtents(const ov::PartialShape& shape) {
+    OPENVINO_ASSERT(shape.rank().is_static(), "Dynamically ranked tensors are not supported, shape: ", shape);
+
+    std::vector<int64_t> extents;
+    extents.reserve(shape.size());
+    for (const auto& dim : shape) {
+        extents.push_back(dim.is_dynamic() ? 0 : dim.get_length());
+    }
+    return extents;
+}
+
+}  // namespace
 
 class DynamicGraphImpl : public DynamicGraph::Impl {
 public:
@@ -98,8 +125,7 @@ void DynamicGraphImpl::initialize(std::optional<ov::Tensor>& blob, NetworkMetada
     auto& inputs = _binding._inputs;
     for (size_t i = 0; i < inputs.size(); ++i) {
         // Use size as placeholder of stride
-        const auto& shape = metadata.inputs[i].shapeFromCompiler.get_shape();
-        std::vector<int64_t> shapeVec(shape.begin(), shape.end());
+        const auto shapeVec = getBindingExtents(metadata.inputs[i].shapeFromCompiler);
         inputs[i] = MemRefType(nullptr, nullptr, 0, shapeVec, shapeVec, shapeVec.size());
         // Calc real stride
         inputs[i].updateStride();
@@ -108,8 +134,7 @@ void DynamicGraphImpl::initialize(std::optional<ov::Tensor>& blob, NetworkMetada
     _binding._outputs.resize(metadata.outputs.size());
     auto& outputs = _binding._outputs;
     for (size_t i = 0; i < outputs.size(); ++i) {
-        const auto& shape = metadata.outputs[i].shapeFromCompiler.get_shape();
-        std::vector<int64_t> shapeVec(shape.begin(), shape.end());
+        const auto shapeVec = getBindingExtents(metadata.outputs[i].shapeFromCompiler);
         outputs[i] = MemRefType(nullptr, nullptr, 0, shapeVec, shapeVec, shapeVec.size());
         outputs[i].updateStride();
     }
@@ -139,15 +164,17 @@ static IODescriptor getIODescriptor(const ze_graph_argument_properties_3_t& arg,
                                     const std::optional<ze_graph_argument_metadata_t>& metadata) {
     auto logger = Logger::global().clone("getIODescriptor");
     ov::element::Type_t precision = zeroUtils::toOVElementType(arg.devicePrecision);
-    ov::Shape shapeFromCompiler;
+    ov::PartialShape shapeFromCompiler;
     ov::PartialShape shapeFromIRModel;
     std::unordered_set<std::string> outputTensorNames;
 
     for (uint32_t id = 0; id < arg.associated_tensor_names_count; id++) {
         outputTensorNames.insert(arg.associated_tensor_names[id]);
     }
+    shapeFromCompiler.reserve(arg.dims_count);
     for (uint32_t id = 0; id < arg.dims_count; id++) {
-        shapeFromCompiler.push_back(arg.dims[id]);
+        shapeFromCompiler.push_back(arg.dims[id] == UNBOUNDED_DIM ? ov::Dimension::dynamic()
+                                                                 : ov::Dimension(arg.dims[id]));
     }
     if (metadata.has_value()) {
         const auto dynamicDim = std::numeric_limits<uint64_t>::max();
@@ -164,8 +191,11 @@ static IODescriptor getIODescriptor(const ze_graph_argument_properties_3_t& arg,
                                 "from compiler has been lost.");
                     // We need to kepp batch dimension dynamic
                     shapeFromIRModel.push_back(ov::Dimension(1, dynamicDim));
+                } else if (shapeFromCompiler[id].is_dynamic()) {
+                    // No upper bound was reported for this dimension either, so there is none to impose.
+                    shapeFromIRModel.push_back(ov::Dimension::dynamic());
                 } else {
-                    shapeFromIRModel.push_back(ov::Dimension(1, shapeFromCompiler[id]));
+                    shapeFromIRModel.push_back(ov::Dimension(1, shapeFromCompiler[id].get_length()));
                 }
             }
         }

@@ -39,6 +39,16 @@ protected:
 
     bool _isTensorChanged = false;
 
+    /**
+     * @brief The output shapes the last prediction computed from the actual input shapes, one entry per
+     * output, empty until the first prediction runs.
+     * @details This is what an output whose shape the compiler could not bound gets allocated at: no upper
+     * bound means there is no capacity in the metadata to fall back on, and unlike an input there is no
+     * tensor the caller must have bound already. The prediction runs before the outputs are prepared, so
+     * the size is known by the time the buffer is allocated.
+     */
+    std::vector<std::optional<ov::Shape>> _predictedOutputShapes;
+
 private:
     std::shared_ptr<IDynamicGraph::GraphArguments> _binding;
 };
