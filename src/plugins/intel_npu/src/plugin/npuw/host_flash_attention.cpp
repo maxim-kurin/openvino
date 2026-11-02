@@ -618,6 +618,8 @@ static ov::ResultVector create_regular_tile_outputs_fused(const FlashAttentionRe
 //                    Final tile:    f32 (present-KV output dtype from upstream graph).
 //   is_final_tile  : If true, creates final tile with division/transpose/reshape.
 //   output_dtype   : Output data type (only used when is_final_tile=true).
+//   q_scale        : Optional scale applied to Q (an intact SDPA keeps it inside the ATTN subgraph,
+//                    while the decomposition moves it onto Q, outside the subgraph).
 static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
                                                         const ov::element::Type& state_dtype,
                                                         const ov::element::Type& kv_tile_dtype,
@@ -629,7 +631,8 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
                                                         bool fused_flash_attention = false,
                                                         bool enable_mask_skipping = false,
                                                         bool v_transposed = true,
-                                                        const ov::element::Type& output_dtype = ov::element::f16) {
+                                                        const ov::element::Type& output_dtype = ov::element::f16,
+                                                        const std::shared_ptr<ov::Node>& q_scale = nullptr) {
     LOG_DEBUG("Creating HFA " << (is_final_tile ? "FINAL " : "") << "tile model with tile_size=" << tile_size
                               << ", kv_num_heads=" << kv_num_heads << ", state_dtype=" << state_dtype
                               << ", kv_tile_dtype=" << kv_tile_dtype << ", mask_dtype=" << mask_dtype
@@ -664,6 +667,11 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
     // For the non-fused operation all tiles require mask
     const bool use_mask = is_final_tile || !fused_flash_attention || !enable_mask_skipping;
     auto f32_nodes = convert_inputs_to_f32(inputs, mask_dtype, compute_dtype, use_mask);
+    if (q_scale) {
+        auto q_scale_f32 = std::make_shared<ov::op::v0::Convert>(q_scale, compute_dtype);
+        f32_nodes.q_f32 = std::make_shared<ov::op::v1::Multiply>(f32_nodes.q_f32, q_scale_f32);
+        f32_nodes.q_f32->set_friendly_name("q_scaled_f32");
+    }
 
     FlashAttentionResults results;
 
@@ -800,8 +808,8 @@ static void build_sdpa_param_mapping(HostFlashAttention& hfa,
         return ov::as_type_ptr<ov::op::v0::Parameter>(skip_convert_nodes(node));
     };
 
-    // Extract Q (query) parameter - input 0 of MatMul1
-    if (auto q_param = extract_param(pattern_nodes.matmul1_node->get_input_node_shared_ptr(0))) {
+    // Extract Q (query) parameter - input 0 of MatMul1 or SDPA
+    if (auto q_param = extract_param(pattern_nodes.query_node())) {
         hfa._query_param_idx = model->get_parameter_index(q_param);
     }
 
@@ -841,9 +849,9 @@ static void build_sdpa_param_mapping(HostFlashAttention& hfa,
                       hfa._present_value_param_idx,
                       "past_value");
 
-    // Extract mask parameter - input 1 of add_node
-    if (auto add_param = extract_param(pattern_nodes.add_node->get_input_node_shared_ptr(1))) {
-        hfa._attention_mask_param_idx = model->get_parameter_index(add_param);
+    // Extract mask parameter - input 1 of add_node or input 3 of SDPA
+    if (auto mask_param = extract_param(pattern_nodes.mask_node())) {
+        hfa._attention_mask_param_idx = model->get_parameter_index(mask_param);
     }
 
     LOG_INFO("Built SDPA input mapping: query="
@@ -1037,7 +1045,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
         return std::nullopt;
     }
 
-    auto q_input = pattern_nodes.matmul1_node->get_input_node_shared_ptr(0);
+    auto q_input = pattern_nodes.query_node();
     auto k_concat = pattern_nodes.past_key_concat_node;
 
     // Skip Convert nodes to get to the actual Parameter/input
@@ -1085,9 +1093,10 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // logic. Defaults to the actual Q shape value, but PropagateSliceUp may have sliced Q's seq_len
     // down to 1, in which case actual_query_size below no longer reflects the original chunk size.
     std::size_t actual_query_size = q_shape_static[2];  // Actual Q seq_len (may be sliced to 1)
-    std::size_t query_size = ov::npuw::resolve_original_query_length(actual_query_size, pattern_nodes.matmul2_node);
+    std::size_t query_size =
+        ov::npuw::resolve_original_query_length(actual_query_size, pattern_nodes.query_length_rt_node());
 
-    auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.add_node);
+    auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.mask_node());
     if (!mask_param) {
         LOG_WARN("Could not find mask parameter in model");
         return std::nullopt;
@@ -1100,6 +1109,22 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
         LOG_DEBUG("Original SDPA output data type: " << output_dtype);
     } else {
         LOG_WARN("No outputs found in model, using default output dtype: " << output_dtype);
+    }
+
+    // An intact SDPA keeps its scale inside the ATTN subgraph, so the tile models apply it to Q.
+    // The decomposed form has already scaled Q outside of the subgraph.
+    std::shared_ptr<ov::Node> q_scale;
+    if (const auto& sdpa = pattern_nodes.sdpa_node) {
+        if (sdpa->get_input_size() > 4) {
+            q_scale = ov::util::get_constant_from_source(sdpa->input_value(4));
+            if (!q_scale) {
+                LOG_WARN("SDPA scale is not a constant, HFA is not supported");
+                return std::nullopt;
+            }
+        } else {
+            const auto head_dim = static_cast<float>(q_shape_static.back());
+            q_scale = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {1.0f / std::sqrt(head_dim)});
+        }
     }
 
     // ========================================================================
@@ -1170,7 +1195,8 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // Per-SDPA mask-skipping decision
     // DetectAttentionMask (run earlier on the original SDPA node) may have annotated
     // this subgraph's Add(QK, mask) node with its mask kind, carried here via
-    // copy_runtime_info() during SDPA decomposition. Per NPUW_SDPA_MASK_RT_KEY's
+    // copy_runtime_info() during SDPA decomposition (or the SDPA itself, when it is
+    // kept intact). Per NPUW_SDPA_MASK_RT_KEY's
     // encoding, the mask-skipping decision is:
     //
     //   no annotation (Unknown) : DISABLED -- unknown mask shape, skipping it could
@@ -1188,8 +1214,8 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // is now just a master kill switch (NPUW_ATTN_HFA_MASK_SKIPPING=NO disables the
     // optimization outright, regardless of mask kind).
     bool local_enable_mask_skipping = false;
-    if (enable_mask_skipping && pattern_nodes.add_node) {
-        const auto& rt_info = pattern_nodes.add_node->get_rt_info();
+    if (enable_mask_skipping && pattern_nodes.mask_rt_node()) {
+        const auto& rt_info = pattern_nodes.mask_rt_node()->get_rt_info();
         const auto it = rt_info.find(ov::npuw::NPUW_SDPA_MASK_RT_KEY);
         if (it != rt_info.end()) {
             const auto encoded = it->second.as<int64_t>();
@@ -1220,7 +1246,9 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
                                             false,
                                             fused_flash_attention,
                                             local_enable_mask_skipping,
-                                            v_transposed);
+                                            v_transposed,
+                                            output_dtype,
+                                            q_scale);
     if (!tile_model) {
         LOG_WARN("Failed to create HFA tile model");
         return std::nullopt;
@@ -1237,7 +1265,8 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
                                                   fused_flash_attention,
                                                   local_enable_mask_skipping,
                                                   v_transposed,
-                                                  output_dtype);
+                                                  output_dtype,
+                                                  q_scale);
     if (!final_tile_model) {
         LOG_WARN("Failed to create HFA final tile model");
         return std::nullopt;

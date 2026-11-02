@@ -4,6 +4,7 @@
 
 #include "sdpa.hpp"
 
+#include <optional>
 #include <regex>
 
 #include "../../logging.hpp"
@@ -87,24 +88,55 @@ namespace attn {
 
 namespace opp = ov::pass::pattern;
 
-SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
-    auto past_k_in = opp::wrap_type<ov::op::v0::Parameter>();
-    // Optional beam-search gather: Parameter → Gather(beam_idx) → ... (stateless LLM models)
-    auto past_k_gather = opp::optional<ov::op::v8::Gather>({past_k_in->output(0), opp::any_input(), opp::any_input()});
-    auto past_k_cvt = opp::optional<ov::op::v0::Convert>({past_k_gather->output(0)});
-    auto past_k_cat = opp::wrap_type<ov::op::v0::Concat>({past_k_cvt, opp::any_input()});
+namespace {
+// Walks a KV-cache Concat past input up to its Parameter: Parameter -> [Gather(beam_idx)] -> [Convert].
+// Returns the nodes on the way (including the Parameter), or nullopt if the input is not a past KV.
+std::optional<std::vector<std::shared_ptr<ov::Node>>> past_kv_chain(const std::shared_ptr<ov::Node>& node) {
+    std::vector<std::shared_ptr<ov::Node>> chain;
+    auto current = node;
+    if (ov::is_type<ov::op::v0::Convert>(current)) {
+        chain.push_back(current);
+        current = current->get_input_node_shared_ptr(0);
+    }
+    if (ov::is_type<ov::op::v8::Gather>(current)) {
+        chain.push_back(current);
+        current = current->get_input_node_shared_ptr(0);
+    }
+    if (!ov::is_type<ov::op::v0::Parameter>(current)) {
+        return std::nullopt;
+    }
+    chain.push_back(current);
+    return chain;
+}
 
-    auto past_v_in = opp::wrap_type<ov::op::v0::Parameter>();
-    auto past_v_gather = opp::optional<ov::op::v8::Gather>({past_v_in->output(0), opp::any_input(), opp::any_input()});
-    auto past_v_cvt = opp::optional<ov::op::v0::Convert>({past_v_gather->output(0)});
-    auto past_v_cat = opp::wrap_type<ov::op::v0::Concat>({past_v_cvt, opp::any_input()});
+// KV-cache Concat: all inputs but the last (present KV) are past KV inputs. More than one past
+// input is the block-split KV-cache layout (see SplitKVCacheIntoBlocks).
+bool is_kv_cache_concat(const ov::Output<ov::Node>& output) {
+    const auto concat = output.get_node_shared_ptr();
+    if (concat->get_input_size() < 2) {
+        return false;
+    }
+    for (size_t i = 0; i + 1 < concat->get_input_size(); ++i) {
+        if (!past_kv_chain(concat->get_input_node_shared_ptr(i))) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
+    auto past_k_cat = opp::wrap_type<ov::op::v0::Concat>(is_kv_cache_concat);
+    auto past_v_cat = opp::wrap_type<ov::op::v0::Concat>(is_kv_cache_concat);
 
     // Optional part, probably one of many. Replace by graph traversal!
     auto opt_unsq_k = opp::optional<ov::op::v0::Unsqueeze>({past_k_cat->output(0), opp::any_input()});
     auto opt_bcast_k = opp::optional<ov::op::v3::Broadcast>({opt_unsq_k->output(0), opp::any_input()});
     auto opt_rshp_k = opp::optional<ov::op::v1::Reshape>({opt_bcast_k->output(0), opp::any_input()});
 
-    auto opt_unsq_v = opp::optional<ov::op::v0::Unsqueeze>({past_v_cat->output(0), opp::any_input()});
+    // Optional Transpose restoring the transposed V-cache layout (NPUW_LLM_DECOMPOSE_SDPA=NO)
+    auto opt_trans_v = opp::optional<ov::op::v1::Transpose>({past_v_cat->output(0), opp::any_input()});
+    auto opt_unsq_v = opp::optional<ov::op::v0::Unsqueeze>({opt_trans_v->output(0), opp::any_input()});
     auto opt_bcast_v = opp::optional<ov::op::v3::Broadcast>({opt_unsq_v->output(0), opp::any_input()});
     auto opt_rshp_v = opp::optional<ov::op::v1::Reshape>({opt_bcast_v->output(0), opp::any_input()});
 
@@ -118,17 +150,27 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
     // Note: Use [=] to make sure the above objects stay alive in the callback
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
-        auto pattern_nodes = std::vector<std::shared_ptr<ov::Node>>{past_k_in,
-                                                                    past_k_gather,
-                                                                    past_k_cvt,
-                                                                    past_k_cat,
-                                                                    past_v_in,
-                                                                    past_v_gather,
-                                                                    past_v_cvt,
+        auto isolate = [&](const std::shared_ptr<ov::Node>& matched_node) {
+            if (auto group_iter = node_to_gptr->find(matched_node); group_iter != node_to_gptr->end()) {
+                group_iter->second->isolate(isol_tag);
+            }
+        };
+        // Past KV inputs of the Concats: Parameter -> [Gather] -> [Convert]
+        for (auto&& cat_pattern : {past_k_cat, past_v_cat}) {
+            const auto concat = node_to_output.at(cat_pattern).get_node_shared_ptr();
+            for (size_t i = 0; i + 1 < concat->get_input_size(); ++i) {
+                const auto chain = past_kv_chain(concat->get_input_node_shared_ptr(i));
+                for (auto&& chain_node : chain.value()) {
+                    isolate(chain_node);
+                }
+            }
+        }
+        auto pattern_nodes = std::vector<std::shared_ptr<ov::Node>>{past_k_cat,
                                                                     past_v_cat,
                                                                     opt_unsq_k,
                                                                     opt_bcast_k,
                                                                     opt_rshp_k,
+                                                                    opt_trans_v,
                                                                     opt_unsq_v,
                                                                     opt_bcast_v,
                                                                     opt_rshp_v,
@@ -137,10 +179,7 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                                                                     reshape};
         for (auto&& pattern_node : pattern_nodes) {
             if (auto match_iter = node_to_output.find(pattern_node); match_iter != node_to_output.end()) {
-                auto matched_node = match_iter->second.get_node_shared_ptr();
-                if (auto group_iter = node_to_gptr->find(matched_node); group_iter != node_to_gptr->end()) {
-                    group_iter->second->isolate(isol_tag);
-                }
+                isolate(match_iter->second.get_node_shared_ptr());
             }
         }
         return false;  // root hasn't changed

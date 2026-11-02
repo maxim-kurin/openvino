@@ -27,8 +27,9 @@ namespace pass {
  * attempt would claim the shared Reshape (and its ancestors) as part of its
  * own partition, creating conflicting assignments.
  *
- * This pass duplicates the [Convert →] Concat → [Unsqueeze] → [Broadcast] → Reshape
- * chain for every extra consumer beyond the first, giving each SDPA its own
+ * This pass duplicates the [Convert →] Concat → [Transpose] → [Unsqueeze] → [Broadcast] → Reshape
+ * chain for every extra consumer beyond the first (the Transpose restores the transposed
+ * V-cache layout when SDPA is kept intact), giving each SDPA its own
  * local chain:
  *
  *   same past_K_blocks… → [new_Convert] → new_Concat_L15 → … → new_Reshape_L15 → SDPA_L15

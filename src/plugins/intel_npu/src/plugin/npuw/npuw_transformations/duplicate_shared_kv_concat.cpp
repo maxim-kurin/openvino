@@ -17,6 +17,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/pass/pattern/op/label.hpp"
 #include "openvino/pass/pattern/op/optional.hpp"
@@ -66,6 +67,7 @@ bool has_param_past_inputs(const std::shared_ptr<ov::op::v0::Concat>& concat) {
 struct KVBroadcastChain {
     std::vector<std::shared_ptr<ov::op::v0::Convert>> converts;
     std::shared_ptr<ov::op::v0::Concat> concat;
+    std::shared_ptr<ov::op::v1::Transpose> transpose;  // V-cache layout restore; may be nullptr
     std::shared_ptr<ov::op::v0::Unsqueeze> unsqueeze;  // may be nullptr
     std::shared_ptr<ov::Node> broadcast;               // v1 or v3 Broadcast; may be nullptr
     std::shared_ptr<ov::op::v1::Reshape> reshape;      // fan-out root
@@ -93,6 +95,12 @@ void duplicate_for_extra_consumers(const KVBroadcastChain& chain) {
         auto new_concat = chain.concat->clone_with_new_inputs(new_concat_inputs);
         copy_runtime_info(chain.concat, new_concat);
         ov::Output<ov::Node> data = new_concat->output(0);
+
+        if (chain.transpose) {
+            auto new_transpose = chain.transpose->clone_with_new_inputs({data, chain.transpose->input_value(1)});
+            copy_runtime_info(chain.transpose, new_transpose);
+            data = new_transpose->output(0);
+        }
 
         if (chain.unsqueeze) {
             ov::OutputVector inputs{data};
@@ -135,7 +143,9 @@ DuplicateSharedKVConcat::DuplicateSharedKVConcat() {
     //              → [optional Broadcast (v1 or v3)]
     //              → Reshape  ← anchored here; predicate checks fan-out and consumer types
     auto p_concat = opp::wrap_type<ov::op::v0::Concat>();
-    auto p_unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({p_concat, opp::any_input()});
+    // Transpose restoring the transposed V-cache layout when SDPA is kept (NPUW_LLM_DECOMPOSE_SDPA=NO)
+    auto p_transpose = opp::optional<ov::op::v1::Transpose>({p_concat, opp::any_input()});
+    auto p_unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({p_transpose, opp::any_input()});
     auto p_broadcast = opp::optional<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({p_unsqueeze, opp::any_input()});
     auto p_reshape =
         opp::wrap_type<ov::op::v1::Reshape>({p_broadcast, opp::any_input()}, [](const ov::Output<ov::Node>& output) {
@@ -171,6 +181,10 @@ DuplicateSharedKVConcat::DuplicateSharedKVConcat() {
                 cur = cur->get_input_node_shared_ptr(0);
             }
             chain.unsqueeze = ov::as_type_ptr<ov::op::v0::Unsqueeze>(cur);
+            if (chain.unsqueeze) {
+                cur = cur->get_input_node_shared_ptr(0);
+            }
+            chain.transpose = ov::as_type_ptr<ov::op::v1::Transpose>(cur);
         }
 
         chain.converts.resize(matched_concat->get_input_size());

@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "common_test_utils/node_builders/constant.hpp"
@@ -17,7 +19,9 @@
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/softmax.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/runtime/icompiled_model.hpp"
 #include "openvino/runtime/iplugin.hpp"
 
@@ -818,4 +822,165 @@ TEST(HostFlashAttentionPositionIdsFindTest, RejectsNonUnitBatchDim) {
 TEST(HostFlashAttentionPositionIdsFindTest, RejectsNonUnitBatchDimIn3D) {
     auto rq = make_position_ids_request(ov::Shape{3, 2, 16});
     EXPECT_EQ(ov::npuw::runtime::host_flash_attention::PositionIDs::find(16, *rq), nullptr);
+}
+
+// ============================================================================
+// KeptSDPA suite — SDPA kept intact (NPUW_LLM_DECOMPOSE_SDPA=NO): the V-cache is
+// stored transposed (concat axis 3) and an explicit Transpose restores the layout
+// SDPA expects. The SDPA scale stays inside the subgraph.
+// ============================================================================
+namespace {
+
+enum class KeptSDPAScale { Constant, Absent, Parameter };
+
+std::shared_ptr<ov::Model> build_kept_sdpa_model(KeptSDPAScale scale_kind = KeptSDPAScale::Constant) {
+    using namespace ov;
+
+    const size_t context_size = PAST_LEN + QUERY_SIZE;
+    const Shape q_shape = {BATCH, NUM_HEADS, QUERY_SIZE, HEAD_DIM};
+    const Shape mask_shape = {BATCH, 1, QUERY_SIZE, context_size};
+
+    auto query = ov::test::utils::make_param(element::f32, q_shape, "query.0");
+    auto past_key =
+        ov::test::utils::make_param(element::f32, Shape{BATCH, NUM_HEADS, PAST_LEN, HEAD_DIM}, "past_key_values.0.key");
+    auto past_val = ov::test::utils::make_param(element::f32,
+                                                Shape{BATCH, NUM_HEADS, HEAD_DIM, PAST_LEN},
+                                                "past_key_values.0.value");
+    auto new_key = ov::test::utils::make_param(element::f32, q_shape, "new_key.0");
+    auto new_val =
+        ov::test::utils::make_param(element::f32, Shape{BATCH, NUM_HEADS, HEAD_DIM, QUERY_SIZE}, "new_value.0");
+    auto mask = ov::test::utils::make_param(element::f32, mask_shape, "mask.0");
+    ParameterVector params = {query, past_key, past_val, new_key, new_val, mask};
+
+    auto key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
+    key_concat->set_friendly_name("concat_key.0");
+    auto val_concat = std::make_shared<op::v0::Concat>(OutputVector{past_val, new_val}, 3);
+    val_concat->set_friendly_name("concat_value.0");
+    auto order = op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2});
+    auto val_restore = std::make_shared<op::v1::Transpose>(val_concat, order);
+    val_restore->set_friendly_name("concat_value.0/vt_restore");
+
+    std::shared_ptr<op::v13::ScaledDotProductAttention> sdpa;
+    switch (scale_kind) {
+    case KeptSDPAScale::Constant: {
+        auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, false);
+        break;
+    }
+    case KeptSDPAScale::Absent:
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, false);
+        break;
+    case KeptSDPAScale::Parameter: {
+        auto scale = ov::test::utils::make_param(element::f32, Shape{}, "scale.0");
+        params.push_back(scale);
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, false);
+        break;
+    }
+    }
+    sdpa->set_friendly_name("sdpa.0");
+
+    ResultVector results;
+    auto make_result = [&](const Output<Node>& out, const std::string& name) {
+        results.push_back(std::make_shared<op::v0::Result>(out));
+        results.back()->set_friendly_name(name);
+    };
+    make_result(key_concat->output(0), "present.0.key");
+    make_result(val_concat->output(0), "present.0.value");
+    make_result(sdpa->output(0), "attn_out.0");
+
+    auto model = std::make_shared<Model>(results, params, "kept_sdpa_model");
+    model->validate_nodes_and_infer_types();
+    return model;
+}
+
+std::shared_ptr<ov::Node> find_node(const std::shared_ptr<ov::Model>& model, const std::string& name) {
+    for (const auto& node : model->get_ops()) {
+        if (node->get_friendly_name() == name) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
+// Returns the Q scale applied by the tile model, or nullopt if Q is not scaled
+std::optional<float> tile_q_scale(const std::shared_ptr<ov::Model>& tile_model) {
+    auto q_scaled = find_node(tile_model, "q_scaled_f32");
+    if (!q_scaled) {
+        return std::nullopt;
+    }
+    auto scale_cvt = q_scaled->get_input_node_shared_ptr(1);
+    auto scale = ov::as_type_ptr<ov::op::v0::Constant>(scale_cvt->get_input_node_shared_ptr(0));
+    if (!scale) {
+        return std::nullopt;
+    }
+    return scale->cast_vector<float>().at(0);
+}
+
+}  // namespace
+
+TEST(HostFlashAttentionKeptSDPATest, FromReturnsValueWithTransposedV) {
+    auto result = ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(), true);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->_k_seq_dim, 2u);
+    EXPECT_EQ(result->_v_seq_dim, 3u);
+    EXPECT_EQ(result->_context_size, QUERY_SIZE + PAST_LEN);
+    EXPECT_EQ(result->_query_size, QUERY_SIZE);
+}
+
+TEST(HostFlashAttentionKeptSDPATest, ParamMappingPointsToSDPAInputs) {
+    auto model = build_kept_sdpa_model();
+    auto result = ov::npuw::function::HostFlashAttention::from(model, true);
+    ASSERT_TRUE(result.has_value());
+    auto index_of = [&](const std::string& name) {
+        for (size_t i = 0; i < model->get_parameters().size(); ++i) {
+            if (model->get_parameters()[i]->get_friendly_name() == name) {
+                return i;
+            }
+        }
+        throw std::runtime_error("parameter '" + name + "' not found");
+    };
+    EXPECT_EQ(result->_query_param_idx, index_of("query.0"));
+    EXPECT_EQ(result->_attention_mask_param_idx, index_of("mask.0"));
+    EXPECT_EQ(result->_present_key_param_idx, index_of("new_key.0"));
+    EXPECT_EQ(result->_present_value_param_idx, index_of("new_value.0"));
+}
+
+TEST(HostFlashAttentionKeptSDPATest, TileModelsApplySDPAScaleToQuery) {
+    for (bool fused : {false, true}) {
+        auto result = ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(), fused);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(tile_q_scale(result->_tile_model), 0.25f) << "fused=" << fused;
+        EXPECT_EQ(tile_q_scale(result->_final_tile_model), 0.25f) << "fused=" << fused;
+    }
+}
+
+TEST(HostFlashAttentionKeptSDPATest, TileModelsApplyDefaultScaleWithoutScaleInput) {
+    auto result = ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(KeptSDPAScale::Absent), true);
+    ASSERT_TRUE(result.has_value());
+    const float expected = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+    EXPECT_EQ(tile_q_scale(result->_tile_model), expected);
+    EXPECT_EQ(tile_q_scale(result->_final_tile_model), expected);
+}
+
+TEST(HostFlashAttentionKeptSDPATest, DecomposedModelDoesNotScaleQuery) {
+    // The decomposition has already scaled Q outside of the ATTN subgraph
+    auto result = ov::npuw::function::HostFlashAttention::from(build_sdpa_model(), true);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(find_node(result->_tile_model, "q_scaled_f32"));
+    EXPECT_FALSE(find_node(result->_final_tile_model, "q_scaled_f32"));
+}
+
+TEST(HostFlashAttentionKeptSDPATest, NonConstantScaleIsRejected) {
+    EXPECT_FALSE(ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(KeptSDPAScale::Parameter), true)
+                     .has_value());
+}
+
+TEST(HostFlashAttentionKeptSDPATest, SDPAMaskRtInfoEnablesMaskSkipping) {
+    auto model = build_kept_sdpa_model();
+    find_node(model, "sdpa.0")->get_rt_info()[ov::npuw::NPUW_SDPA_MASK_RT_KEY] = ov::npuw::NPUW_SDPA_MASK_CAUSAL;
+
+    auto result = ov::npuw::function::HostFlashAttention::from(model, true, true);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->_tile_model->inputs().size(), 6u);
+    EXPECT_EQ(result->_final_tile_model->inputs().size(), 7u);
 }

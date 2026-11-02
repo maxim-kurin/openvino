@@ -105,7 +105,7 @@ std::optional<ov::npuw::function::Attention> create_attention_from_model(
     }
 
     // Find mask parameter in the model
-    auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.add_node);
+    auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.mask_node());
     if (!mask_param) {
         LOG_WARN("Could not find mask parameter in model");
         return std::nullopt;
@@ -411,7 +411,7 @@ std::optional<PyramidModelResult> process_pyramid_model(const std::shared_ptr<ov
         // Directly set partial shape on the Parameter node — bypasses reshape() name/pointer
         // lookup entirely. reshape(Output<Node>) can silently miss, reshape(string) uses
         // tensor names (not friendly names), so set_partial_shape() is the safest path.
-        auto mask_param = ov::npuw::util::find_mask_parameter(cloned_pattern.add_node);
+        auto mask_param = ov::npuw::util::find_mask_parameter(cloned_pattern.mask_node());
         if (!mask_param) {
             LOG_WARN("Could not find mask parameter for block-mode pyramid model[" << model_idx << "]");
             return std::nullopt;
@@ -571,26 +571,28 @@ std::optional<PyramidValidationResult> validate_and_setup_pyramid_attention(cons
         return std::nullopt;
     }
 
-    LOG_INFO("Found SDPA pattern: MatMul -> Add -> Softmax -> MatMul");
+    LOG_INFO("Found SDPA pattern: " << (pattern_nodes.sdpa_node ? "ScaledDotProductAttention"
+                                                                : "MatMul -> Add -> Softmax -> MatMul"));
 
     // Extract query_length and full_context_length
     // Strategy 1: Check if PropagateSliceUp has marked the SDPA (MatMul2) with original query_length
-    // Strategy 2: Fall back to Softmax output shape
-    auto softmax_output_shape = pattern_nodes.softmax_node->get_output_shape(0);
+    // Strategy 2: Fall back to the attention scores shape
+    const auto scores_shape = pattern_nodes.scores_shape();
     size_t query_length = 0;
     size_t full_context_length = 0;
 
-    // First, get full_context_length and the default (fallback) query_length from Softmax output
-    if (softmax_output_shape.size() >= 2) {
-        full_context_length = softmax_output_shape.back();                     // Last dimension (context length)
-        query_length = softmax_output_shape[softmax_output_shape.size() - 2];  // Second-to-last dimension
+    // First, get full_context_length and the default (fallback) query_length from the scores shape
+    if (scores_shape.is_static() && scores_shape.size() >= 2) {
+        const auto scores_static_shape = scores_shape.to_shape();
+        full_context_length = scores_static_shape.back();                    // Last dimension (context length)
+        query_length = scores_static_shape[scores_static_shape.size() - 2];  // Second-to-last dimension
     } else {
-        LOG_WARN("Softmax output shape has insufficient dimensions: " << softmax_output_shape.size());
+        LOG_WARN("Attention scores shape is dynamic or has insufficient dimensions: " << scores_shape);
         return std::nullopt;
     }
 
     // Try to get query_length from PropagateSliceUp rt_info (more reliable after slice propagation)
-    query_length = ov::npuw::resolve_original_query_length(query_length, pattern_nodes.matmul2_node);
+    query_length = ov::npuw::resolve_original_query_length(query_length, pattern_nodes.query_length_rt_node());
 
     LOG_DEBUG("Pyramid attention parameters: query_length=" << query_length
                                                             << ", full_context_length=" << full_context_length);
@@ -654,7 +656,7 @@ std::optional<PyramidValidationResult> validate_and_setup_pyramid_attention(cons
         // variant models may drop surplus block parameters, shifting all subsequent parameter
         // indices — the mask's LOCAL index within a variant model is generally NOT the same as
         // its GLOBAL index here, so callers must compare against this global index instead.
-        auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.add_node);
+        auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.mask_node());
         if (!mask_param) {
             LOG_WARN("Could not find mask parameter in original model for block-split pyramid attention");
             return std::nullopt;

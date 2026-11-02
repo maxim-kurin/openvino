@@ -306,6 +306,8 @@ struct SDPAPatternNodes {
     std::shared_ptr<ov::Node> matmul2_node = nullptr;
     std::shared_ptr<ov::Node> softmax_node = nullptr;
     std::shared_ptr<ov::Node> add_node = nullptr;
+    // Set instead of the four nodes above when SDPA is kept intact (NPUW_LLM_DECOMPOSE_SDPA=NO)
+    std::shared_ptr<ov::Node> sdpa_node = nullptr;
     // 1 (contiguous) or N (block-split) Parameter nodes feeding the KV Concat.
     std::vector<std::shared_ptr<ov::Node>> past_key_param_nodes;
     std::vector<std::shared_ptr<ov::Node>> past_value_param_nodes;
@@ -313,13 +315,33 @@ struct SDPAPatternNodes {
     std::shared_ptr<ov::Node> past_value_concat_node = nullptr;
 
     bool is_valid() const {
-        return matmul1_node && matmul2_node && softmax_node && add_node && past_key_concat_node &&
-               past_value_concat_node;
+        const bool has_attention = sdpa_node || (matmul1_node && matmul2_node && softmax_node && add_node);
+        return has_attention && past_key_concat_node && past_value_concat_node;
     }
+
+    // Accessors that work for both the decomposed and the intact SDPA form.
+    // Q input producer: MatMul1 input 0 or SDPA input 0
+    std::shared_ptr<ov::Node> query_node() const;
+    // Additive mask producer: Add input 1 or SDPA input 3
+    std::shared_ptr<ov::Node> mask_node() const;
+    // K/V consumer inputs: MatMul1/MatMul2 input 1 or SDPA input 1/2
+    ov::Input<ov::Node> key_input() const;
+    ov::Input<ov::Node> value_input() const;
+    // Node carrying NPUW_SDPA_MASK_RT_KEY: the mask Add or the SDPA itself
+    std::shared_ptr<ov::Node> mask_rt_node() const {
+        return sdpa_node ? sdpa_node : add_node;
+    }
+    // Node carrying NPUW_ORIGINAL_QUERY_LENGTH_RT_KEY: MatMul2 or the SDPA itself
+    std::shared_ptr<ov::Node> query_length_rt_node() const {
+        return sdpa_node ? sdpa_node : matmul2_node;
+    }
+    // Attention scores shape, [..., query_len, context_len]: the Softmax output or {Q[-2], K[-2]} for SDPA
+    ov::PartialShape scores_shape() const;
 
     // Log pattern information for debugging. prefix is optional.
     void log_pattern(const std::string& prefix = "") const {
         LOG_DEBUG("SDPA Pattern " << prefix << " nodes:");
+        LOG_DEBUG("  SDPA: " << (sdpa_node ? sdpa_node->get_friendly_name() : "null"));
         LOG_DEBUG("  MatMul1: " << (matmul1_node ? matmul1_node->get_friendly_name() : "null"));
         LOG_DEBUG("  Add: " << (add_node ? add_node->get_friendly_name() : "null"));
         LOG_DEBUG("  Softmax: " << (softmax_node ? softmax_node->get_friendly_name() : "null"));
@@ -332,14 +354,15 @@ struct SDPAPatternNodes {
     }
 };
 
-// Find the decomposed SDPA sub-graph pattern (MatMul->Add->Softmax->MatMul) in a
-// model and return all relevant nodes.  Returns an invalid result if not found.
+// Find the SDPA sub-graph pattern in a model and return all relevant nodes: either the
+// decomposed form (MatMul->Add->Softmax->MatMul) or an intact ScaledDotProductAttention
+// with an explicit mask and KV-cache Concats.  Returns an invalid result if not found.
 SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
 std::vector<SDPAPatternNodes> find_all_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
 
-// Traverse upward from an Add node's mask input to find the attention-mask
-// Parameter.  Only unary ops are traversed; returns nullptr on failure.
-std::shared_ptr<ov::op::v0::Parameter> find_mask_parameter(const std::shared_ptr<ov::Node>& add_node);
+// Traverse upward from the mask producer (see SDPAPatternNodes::mask_node()) to find the
+// attention-mask Parameter.  Only unary ops are traversed; returns nullptr on failure.
+std::shared_ptr<ov::op::v0::Parameter> find_mask_parameter(const std::shared_ptr<ov::Node>& mask_node);
 
 template <typename T>
 void fill_tensor(ov::SoPtr<ov::ITensor> tensor, T fill_val, size_t offset = 0u) {
