@@ -265,4 +265,47 @@ TEST_F(OptimizeValueTensorsPassTest, SharedGqaConcatGenerateValueIsTransposedOnc
     }
 }
 
+// NPUW_LLM_DECOMPOSE_SDPA=NO keeps SDPA ops, the V-cache layout is still transposed and an
+// explicit Transpose{0,1,3,2} restores the layout SDPA expects.
+class OptimizeValueTensorsKeepSDPATest : public ov::test::npuw::LLMPassTestFixture,
+                                         public ::testing::WithParamInterface<std::tuple<std::string, bool>> {};
+
+INSTANTIATE_TEST_SUITE_P(SubModels,
+                         OptimizeValueTensorsKeepSDPATest,
+                         ::testing::Combine(::testing::Values(std::string{"_prefill"}, std::string{"_kv"}),
+                                            ::testing::Bool()),
+                         [](const ::testing::TestParamInfo<std::tuple<std::string, bool>>& info) {
+                             auto name = std::get<0>(info.param).substr(1);
+                             return name + (std::get<1>(info.param) ? "_GQA" : "_MHA");
+                         });
+
+TEST_P(OptimizeValueTensorsKeepSDPATest, SDPAKeptWithExplicitVTranspose) {
+    const auto& [fragment, gqa] = GetParam();
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    const ov::AnyMap props = {{"NPUW_LLM_OPTIMIZE_V_TENSORS", "YES"},
+                              {"NPUW_LLM_DECOMPOSE_SDPA", "NO"},
+                              {"NPUW_LLM_PREFILL_ATTENTION_HINT", "STATIC"}};
+    auto model = gqa ? ov::test::npuw::build_llm_gqa_test_model() : ov::test::npuw::build_llm_test_model();
+    ASSERT_NO_THROW(compiled = create_compiled_model(model, props, recorder));
+    ASSERT_NE(compiled, nullptr);
+
+    const auto& sub = require_sub_model_containing(recorder, fragment);
+
+    EXPECT_GT(count_ops<ov::op::v13::ScaledDotProductAttention>(sub.model), 0u);
+    EXPECT_EQ(count_ops<ov::op::v8::Softmax>(sub.model), 0u);
+
+    size_t restore_count = 0;
+    for (const auto& op : sub.model->get_ops()) {
+        if (auto transpose = ov::as_type_ptr<ov::op::v1::Transpose>(op)) {
+            auto order = ov::as_type_ptr<ov::op::v0::Constant>(transpose->input_value(1).get_node_shared_ptr());
+            if (order && order->cast_vector<int64_t>() == std::vector<int64_t>{0, 1, 3, 2}) {
+                ++restore_count;
+            }
+        }
+    }
+    EXPECT_GT(restore_count, 0u);
+}
+
 }  // namespace
