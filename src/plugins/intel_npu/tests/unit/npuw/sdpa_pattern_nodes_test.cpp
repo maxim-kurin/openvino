@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "common_test_utils/node_builders/constant.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
@@ -20,7 +21,6 @@
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/openvino.hpp"
-#include "common_test_utils/node_builders/constant.hpp"
 #include "util.hpp"
 
 namespace {
@@ -868,11 +868,13 @@ struct KeptSDPAModel {
 
 // query [1, 4, 2, 64]; K-cache concat on axis 2; V-cache stored transposed (concat axis 3) and
 // restored by an explicit Transpose right before SDPA.
-KeptSDPAModel build_kept_sdpa_model(bool causal = false, bool with_kv_cache = true) {
+KeptSDPAModel build_kept_sdpa_model(bool causal = false,
+                                    bool with_kv_cache = true,
+                                    ov::element::Type mask_type = ov::element::f32) {
     using namespace ov;
     KeptSDPAModel built;
     auto query = ov::test::utils::make_param(element::f32, Shape{1, 4, 2, 64}, "query.0");
-    auto mask = ov::test::utils::make_param(element::f32, Shape{1, 1, 2, 10}, "mask.0");
+    auto mask = ov::test::utils::make_param(mask_type, Shape{1, 1, 2, 10}, "mask.0");
     ParameterVector params{query, mask};
 
     Output<Node> key, value;
@@ -929,15 +931,28 @@ TEST(SDPAPatternNodesTest, FindsKeptSDPAThroughVRestoreTranspose) {
     EXPECT_EQ(pattern.past_value_param_nodes.size(), 1u);
 }
 
-TEST(SDPAPatternNodesTest, SkipsCausalKeptSDPA) {
+TEST(SDPAPatternNodesTest, CausalKeptSDPAHasNoAdditiveMask) {
     auto built = build_kept_sdpa_model(/*causal=*/true);
-    EXPECT_FALSE(ov::npuw::util::find_sdpa_pattern_nodes(built.model).is_valid());
-    EXPECT_TRUE(ov::npuw::util::find_all_sdpa_pattern_nodes(built.model).empty());
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.sdpa_node, built.sdpa);
+    EXPECT_EQ(pattern.mask_node(), nullptr);
+    EXPECT_EQ(ov::npuw::util::find_mask_parameter(pattern.mask_node()), nullptr);
 }
 
-TEST(SDPAPatternNodesTest, SkipsKeptSDPAWithoutKVCache) {
+TEST(SDPAPatternNodesTest, BooleanMaskKeptSDPAHasNoAdditiveMask) {
+    auto built = build_kept_sdpa_model(/*causal=*/false, /*with_kv_cache=*/true, ov::element::boolean);
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.mask_node(), nullptr);
+}
+
+TEST(SDPAPatternNodesTest, KeptSDPAWithoutKVCacheIsInvalid) {
     auto built = build_kept_sdpa_model(/*causal=*/false, /*with_kv_cache=*/false);
-    EXPECT_TRUE(ov::npuw::util::find_all_sdpa_pattern_nodes(built.model).empty());
+    auto patterns = ov::npuw::util::find_all_sdpa_pattern_nodes(built.model);
+    ASSERT_EQ(patterns.size(), 1u);
+    EXPECT_EQ(patterns[0].sdpa_node, built.sdpa);
+    EXPECT_FALSE(patterns[0].is_valid());
 }
 
 TEST(SDPAPatternNodesTest, DecomposedAccessorsPointToMatMulsAndAdd) {

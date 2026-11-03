@@ -1394,13 +1394,12 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
         }
     }
 
-    // Helper lambda to trace from MatMul to find Concat node
-    auto find_concat_from_matmul = [](const std::shared_ptr<ov::Node>& matmul_node,
-                                      size_t input_idx) -> std::shared_ptr<ov::Node> {
-        if (!matmul_node)
+    // Helper lambda to trace from the attention K/V input (MatMul or SDPA) to find Concat node
+    auto find_kv_concat = [](const std::shared_ptr<ov::Node>& node, size_t input_idx) -> std::shared_ptr<ov::Node> {
+        if (!node)
             return nullptr;
 
-        auto current_node = matmul_node->input(input_idx).get_source_output().get_node_shared_ptr();
+        auto current_node = node->input(input_idx).get_source_output().get_node_shared_ptr();
 
         // Traverse backwards through reshape/transpose operations to find Concat
         while (current_node) {
@@ -1431,80 +1430,58 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
     // Search for the pattern: MatMul -> Add -> Softmax -> MatMul, or an intact SDPA
     auto ops = model->get_ordered_ops();
     for (auto&& node : ops) {
-        if (auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
-            LOG_DEBUG("Examining node: " << sdpa->get_friendly_name() << " (" << sdpa->get_type_name() << ")");
-            // Only the Q, K, V, mask[, scale] form: the mask is applied explicitly and there is no sink
-            if (sdpa->get_causal() || sdpa->get_input_size() < 4 || sdpa->get_input_size() > 5) {
-                LOG_DEBUG("SDPA is causal, has no mask or has a sink, skipping pattern check");
-                continue;
-            }
-            if (sdpa->get_input_element_type(3) == ov::element::boolean) {
-                LOG_DEBUG("SDPA mask is boolean, skipping pattern check");
-                continue;
-            }
-            ov::npuw::util::SDPAPatternNodes candidate;
-            candidate.sdpa_node = sdpa;
-            candidate.past_key_concat_node = find_concat_from_matmul(sdpa, 1);
-            candidate.past_value_concat_node = find_concat_from_matmul(sdpa, 2);
-            if (!candidate.past_key_concat_node || !candidate.past_value_concat_node) {
-                // E.g. cross-attention without a KV-cache
-                LOG_DEBUG("SDPA K/V are not fed by Concat, skipping pattern check");
-                continue;
-            }
-            candidate.past_key_param_nodes = all_past_key_params;
-            candidate.past_value_param_nodes = all_past_value_params;
-            candidate.log_pattern(std::to_string(pattern_nodes.size()));
-
-            pattern_nodes.push_back(candidate);
-            if (!findAll) {
-                break;
-            }
-            continue;
-        }
-        if (!ov::is_type<ov::op::v8::Softmax>(node))
-            continue;
-        LOG_DEBUG("Examining node: " << node->get_friendly_name() << " (" << node->get_type_name() << ")");
-
         ov::npuw::util::SDPAPatternNodes candidate;
         auto& current_node = candidate;
-        current_node.softmax_node = node;
 
-        // Check if softmax is fed by Add - TODO: how optional is add?
-        auto softmax_input = node->input(0).get_source_output().get_node_shared_ptr();
-        if (!ov::is_type<ov::op::v1::Add>(softmax_input)) {
-            LOG_DEBUG("Softmax input is not Add(" << softmax_input->get_friendly_name() << "), skipping pattern check");
-            continue;
-        }
-        current_node.add_node = softmax_input;
+        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(node)) {
+            LOG_DEBUG("Examining node: " << node->get_friendly_name() << " (" << node->get_type_name() << ")");
+            current_node.sdpa_node = node;
+            current_node.past_key_concat_node = find_kv_concat(node, 1);
+            current_node.past_value_concat_node = find_kv_concat(node, 2);
+        } else if (ov::is_type<ov::op::v8::Softmax>(node)) {
+            LOG_DEBUG("Examining node: " << node->get_friendly_name() << " (" << node->get_type_name() << ")");
+            current_node.softmax_node = node;
 
-        // Check if add is fed by MatMul (first MatMul)
-        auto add_input0 = current_node.add_node->input(0).get_source_output().get_node_shared_ptr();
-        if (!ov::is_type<ov::op::v0::MatMul>(add_input0)) {
-            LOG_DEBUG("Add input is not MatMul(" << add_input0->get_friendly_name() << "), skipping pattern check");
-            continue;
-        }
-        current_node.matmul1_node = add_input0;
-
-        // Find Concat node for past key (input 1 of MatMul1)
-        current_node.past_key_concat_node = find_concat_from_matmul(current_node.matmul1_node, 1);
-
-        // Check if softmax feeds into MatMul (second MatMul)
-        for (auto&& output : node->outputs()) {
-            for (auto&& target_input : output.get_target_inputs()) {
-                auto target_node = target_input.get_node()->shared_from_this();
-                if (ov::is_type<ov::op::v0::MatMul>(target_node)) {
-                    current_node.matmul2_node = target_node;
-
-                    // Find Concat node for past value (input 1 of MatMul2)
-                    current_node.past_value_concat_node = find_concat_from_matmul(current_node.matmul2_node, 1);
-                    break;
-                }
+            // Check if softmax is fed by Add - TODO: how optional is add?
+            auto softmax_input = node->input(0).get_source_output().get_node_shared_ptr();
+            if (!ov::is_type<ov::op::v1::Add>(softmax_input)) {
+                LOG_DEBUG("Softmax input is not Add(" << softmax_input->get_friendly_name()
+                                                      << "), skipping pattern check");
+                continue;
             }
-            if (current_node.matmul2_node)
-                break;
-        }
-        if (!current_node.matmul2_node) {
-            LOG_DEBUG("Softmax does not feed into MatMul, skipping pattern check");
+            current_node.add_node = softmax_input;
+
+            // Check if add is fed by MatMul (first MatMul)
+            auto add_input0 = current_node.add_node->input(0).get_source_output().get_node_shared_ptr();
+            if (!ov::is_type<ov::op::v0::MatMul>(add_input0)) {
+                LOG_DEBUG("Add input is not MatMul(" << add_input0->get_friendly_name() << "), skipping pattern check");
+                continue;
+            }
+            current_node.matmul1_node = add_input0;
+
+            // Find Concat node for past key (input 1 of MatMul1)
+            current_node.past_key_concat_node = find_kv_concat(current_node.matmul1_node, 1);
+
+            // Check if softmax feeds into MatMul (second MatMul)
+            for (auto&& output : node->outputs()) {
+                for (auto&& target_input : output.get_target_inputs()) {
+                    auto target_node = target_input.get_node()->shared_from_this();
+                    if (ov::is_type<ov::op::v0::MatMul>(target_node)) {
+                        current_node.matmul2_node = target_node;
+
+                        // Find Concat node for past value (input 1 of MatMul2)
+                        current_node.past_value_concat_node = find_kv_concat(current_node.matmul2_node, 1);
+                        break;
+                    }
+                }
+                if (current_node.matmul2_node)
+                    break;
+            }
+            if (!current_node.matmul2_node) {
+                LOG_DEBUG("Softmax does not feed into MatMul, skipping pattern check");
+                continue;
+            }
+        } else {
             continue;
         }
 
@@ -1547,7 +1524,13 @@ std::shared_ptr<ov::Node> ov::npuw::util::SDPAPatternNodes::query_node() const {
 
 std::shared_ptr<ov::Node> ov::npuw::util::SDPAPatternNodes::mask_node() const {
     if (sdpa_node) {
-        return sdpa_node->get_input_size() > 3 ? sdpa_node->get_input_node_shared_ptr(3) : nullptr;
+        // Only an explicit additive mask: a causal flag or a boolean mask is applied implicitly by SDPA
+        const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(sdpa_node);
+        if (sdpa->get_causal() || sdpa->get_input_size() < 4 ||
+            sdpa->get_input_element_type(3) == ov::element::boolean) {
+            return nullptr;
+        }
+        return sdpa->get_input_node_shared_ptr(3);
     }
     return add_node && add_node->get_input_size() > 1 ? add_node->get_input_node_shared_ptr(1) : nullptr;
 }

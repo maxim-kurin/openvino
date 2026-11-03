@@ -322,7 +322,7 @@ struct SDPAPatternNodes {
     // Accessors that work for both the decomposed and the intact SDPA form.
     // Q input producer: MatMul1 input 0 or SDPA input 0
     std::shared_ptr<ov::Node> query_node() const;
-    // Additive mask producer: Add input 1 or SDPA input 3
+    // Additive mask producer: Add input 1 or SDPA input 3 (nullptr for a causal SDPA or a boolean mask)
     std::shared_ptr<ov::Node> mask_node() const;
     // K/V consumer inputs: MatMul1/MatMul2 input 1 or SDPA input 1/2
     ov::Input<ov::Node> key_input() const;
@@ -355,8 +355,8 @@ struct SDPAPatternNodes {
 };
 
 // Find the SDPA sub-graph pattern in a model and return all relevant nodes: either the
-// decomposed form (MatMul->Add->Softmax->MatMul) or an intact ScaledDotProductAttention
-// with an explicit mask and KV-cache Concats.  Returns an invalid result if not found.
+// decomposed form (MatMul->Add->Softmax->MatMul) or an intact ScaledDotProductAttention.
+// Returns an invalid result if not found.
 SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
 std::vector<SDPAPatternNodes> find_all_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
 
