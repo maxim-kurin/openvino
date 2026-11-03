@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "common_test_utils/node_builders/constant.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
@@ -16,9 +17,10 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/softmax.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/openvino.hpp"
-#include "common_test_utils/node_builders/constant.hpp"
 #include "util.hpp"
 
 namespace {
@@ -855,3 +857,114 @@ TEST(SdpaPatternNodesTest, FindAllBlockKvCachePatternStructureIsValid) {
 }
 
 }  // namespace
+
+// --- Intact ScaledDotProductAttention (NPUW_LLM_DECOMPOSE_SDPA=NO) ---
+namespace {
+
+struct KeptSDPAModel {
+    std::shared_ptr<ov::Model> model;
+    std::shared_ptr<ov::Node> sdpa, key_concat, value_concat, query, mask;
+};
+
+// query [1, 4, 2, 64]; K-cache concat on axis 2; V-cache stored transposed (concat axis 3) and
+// restored by an explicit Transpose right before SDPA.
+KeptSDPAModel build_kept_sdpa_model(bool causal = false,
+                                    bool with_kv_cache = true,
+                                    ov::element::Type mask_type = ov::element::f32) {
+    using namespace ov;
+    KeptSDPAModel built;
+    auto query = ov::test::utils::make_param(element::f32, Shape{1, 4, 2, 64}, "query.0");
+    auto mask = ov::test::utils::make_param(mask_type, Shape{1, 1, 2, 10}, "mask.0");
+    ParameterVector params{query, mask};
+
+    Output<Node> key, value;
+    if (with_kv_cache) {
+        auto past_key = ov::test::utils::make_param(element::f32, Shape{1, 4, 8, 64}, "past_key_values.0.key");
+        auto past_value = ov::test::utils::make_param(element::f32, Shape{1, 4, 64, 8}, "past_key_values.0.value");
+        auto new_key = ov::test::utils::make_param(element::f32, Shape{1, 4, 2, 64}, "new_key.0");
+        auto new_value = ov::test::utils::make_param(element::f32, Shape{1, 4, 64, 2}, "new_value.0");
+        params.insert(params.end(), {past_key, past_value, new_key, new_value});
+        built.key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
+        built.value_concat = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 3);
+        key = built.key_concat;
+        value = std::make_shared<op::v1::Transpose>(built.value_concat,
+                                                    op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2}));
+    } else {
+        // Cross-attention: K/V come straight from the encoder
+        auto enc_key = ov::test::utils::make_param(element::f32, Shape{1, 4, 10, 64}, "encoder_key.0");
+        auto enc_value = ov::test::utils::make_param(element::f32, Shape{1, 4, 10, 64}, "encoder_value.0");
+        params.insert(params.end(), {enc_key, enc_value});
+        key = enc_key;
+        value = enc_value;
+    }
+    auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.125f});
+    built.sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key, value, mask, scale, causal);
+    built.query = query;
+    built.mask = mask;
+    built.model = std::make_shared<Model>(ResultVector{std::make_shared<op::v0::Result>(built.sdpa)}, params);
+    built.model->validate_nodes_and_infer_types();
+    return built;
+}
+
+}  // namespace
+
+TEST(SDPAPatternNodesTest, FindsKeptSDPAThroughVRestoreTranspose) {
+    auto built = build_kept_sdpa_model();
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.sdpa_node, built.sdpa);
+    EXPECT_EQ(pattern.matmul1_node, nullptr);
+    EXPECT_EQ(pattern.softmax_node, nullptr);
+    EXPECT_EQ(pattern.past_key_concat_node, built.key_concat);
+    EXPECT_EQ(pattern.past_value_concat_node, built.value_concat);
+    EXPECT_EQ(pattern.query_node(), built.query);
+    EXPECT_EQ(pattern.mask_node(), built.mask);
+    EXPECT_EQ(pattern.mask_rt_node(), built.sdpa);
+    EXPECT_EQ(pattern.query_length_rt_node(), built.sdpa);
+    EXPECT_EQ(pattern.key_input().get_node(), built.sdpa.get());
+    EXPECT_EQ(pattern.key_input().get_index(), 1u);
+    EXPECT_EQ(pattern.value_input().get_index(), 2u);
+    EXPECT_EQ(pattern.scores_shape(), (ov::PartialShape{2, 10}));
+    EXPECT_EQ(ov::npuw::util::find_mask_parameter(pattern.mask_node()), built.mask);
+    EXPECT_EQ(pattern.past_key_param_nodes.size(), 1u);
+    EXPECT_EQ(pattern.past_value_param_nodes.size(), 1u);
+}
+
+TEST(SDPAPatternNodesTest, CausalKeptSDPAHasNoAdditiveMask) {
+    auto built = build_kept_sdpa_model(/*causal=*/true);
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.sdpa_node, built.sdpa);
+    EXPECT_EQ(pattern.mask_node(), nullptr);
+    EXPECT_EQ(ov::npuw::util::find_mask_parameter(pattern.mask_node()), nullptr);
+}
+
+TEST(SDPAPatternNodesTest, BooleanMaskKeptSDPAHasNoAdditiveMask) {
+    auto built = build_kept_sdpa_model(/*causal=*/false, /*with_kv_cache=*/true, ov::element::boolean);
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.mask_node(), nullptr);
+}
+
+TEST(SDPAPatternNodesTest, KeptSDPAWithoutKVCacheIsInvalid) {
+    auto built = build_kept_sdpa_model(/*causal=*/false, /*with_kv_cache=*/false);
+    auto patterns = ov::npuw::util::find_all_sdpa_pattern_nodes(built.model);
+    ASSERT_EQ(patterns.size(), 1u);
+    EXPECT_EQ(patterns[0].sdpa_node, built.sdpa);
+    EXPECT_FALSE(patterns[0].is_valid());
+}
+
+TEST(SDPAPatternNodesTest, DecomposedAccessorsPointToMatMulsAndAdd) {
+    auto built = build_sdpa_model(1);
+    auto pattern = ov::npuw::util::find_sdpa_pattern_nodes(built.model);
+    ASSERT_TRUE(pattern.is_valid());
+    EXPECT_EQ(pattern.sdpa_node, nullptr);
+    EXPECT_EQ(pattern.query_node(), pattern.matmul1_node->get_input_node_shared_ptr(0));
+    EXPECT_EQ(pattern.mask_node(), pattern.add_node->get_input_node_shared_ptr(1));
+    EXPECT_EQ(pattern.mask_rt_node(), pattern.add_node);
+    EXPECT_EQ(pattern.query_length_rt_node(), pattern.matmul2_node);
+    EXPECT_EQ(pattern.key_input().get_node(), pattern.matmul1_node.get());
+    EXPECT_EQ(pattern.value_input().get_node(), pattern.matmul2_node.get());
+    EXPECT_EQ(pattern.scores_shape(), pattern.softmax_node->get_output_partial_shape(0));
+}

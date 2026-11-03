@@ -44,6 +44,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reduce_min.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/openvino.hpp"
@@ -301,6 +302,37 @@ TEST(KVCacheCompressionPassRegressionTest, NonTransposedValueUsesEmbeddingReduct
     }
     EXPECT_EQ(key_reduce_axis_count, 1u);
     EXPECT_EQ(value_reduce_axis_count, 1u);
+}
+
+// An intact SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO, DYNAMIC attention) is not rewired with past-cache
+// dequantization: only the decomposed SDPA form is supported, so no scale/zp Parameters are added.
+TEST(KVCacheCompressionPassRegressionTest, IntactSDPAIsNotRewired) {
+    const Shape kv_shape{1, 4, 8, 16};
+    auto query = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
+    auto past_key = std::make_shared<op::v0::Parameter>(element::f32, kv_shape);
+    past_key->set_friendly_name("past_key_values.0.key");
+    past_key->output(0).set_names({"past_key_values.0.key"});
+    auto past_value = std::make_shared<op::v0::Parameter>(element::f32, kv_shape);
+    past_value->set_friendly_name("past_key_values.0.value");
+    past_value->output(0).set_names({"past_key_values.0.value"});
+    auto new_key = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
+    auto new_value = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
+    auto mask = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 1, 1, 9});
+    auto key = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
+    auto value = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 2);
+    auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key, value, mask, false);
+    auto model = std::make_shared<Model>(
+        ResultVector{std::make_shared<op::v0::Result>(sdpa),
+                     std::make_shared<op::v0::Result>(key),
+                     std::make_shared<op::v0::Result>(value)},
+        ParameterVector{query, past_key, past_value, new_key, new_value, mask});
+    const size_t params_before = model->get_parameters().size();
+
+    ov::npuw::KVCacheCompressionParams params;
+    params.key = {QuantizationType::Asymmetric, element::i8};
+    params.value = {QuantizationType::Symmetric, element::i8};
+    ASSERT_NO_THROW(ov::npuw::run_kv_cache_dynamic_quantization_passes(model, params, false));
+    EXPECT_EQ(model->get_parameters().size(), params_before);
 }
 
 // The pass must inject exactly (num_sdpa * 2 * added_per_cache) new Parameters
