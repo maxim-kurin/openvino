@@ -5,6 +5,7 @@
 #include "optimize_value_tensors.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <transformations/op_conversions/scaled_dot_product_attention_decomposition.hpp>
 #include <unordered_set>
 #include <vector>
@@ -76,16 +77,52 @@ public:
     };
 
 protected:
-    // generic part of matchers, to transpose v-tensors, and concat, and update matmul args
-    void transpose_matmul_b(Context::Ref ctx,
-                            const std::shared_ptr<ov::op::v0::Parameter>& matched_param,
-                            const std::shared_ptr<ov::op::v0::Concat>& matched_concat,
-                            const std::shared_ptr<ov::op::v1::Transpose>& matched_transpose,
-                            const std::shared_ptr<ov::op::v0::MatMul>& matched_matmul) {
+    // MQA: aten::transpose on a dim-1 axis (num_kv_heads==1) is optimized by the
+    // frontend into a Reshape instead of a real Transpose. Replace such a Reshape with a
+    // real Transpose so that transpose_v_cache can set the permutation order uniformly.
+    // The placeholder order {0,2,1,3} will be overwritten to {0,2,3,1} by transpose_v_cache.
+    // Returns the (possibly new) Transpose, or nullptr if the node is a Reshape that is
+    // not a genuine MQA fake-transpose.
+    static std::shared_ptr<ov::Node> to_real_transpose(const std::shared_ptr<ov::Node>& node) {
+        if (!ov::is_type<ov::op::v1::Reshape>(node)) {
+            return node;
+        }
+        // Only accept a Reshape that is semantically a genuine MQA fake-transpose:
+        //   [B, Snew, 1, D] → [B, 1, Snew, D]
+        // i.e. 4D→4D, axes 1 and 2 are swapped, and the swapped-out dim equals 1
+        // (num_kv_heads==1).  Any other Reshape (e.g. 3D→4D in negative tests)
+        // must be rejected so the matcher does not fire.
+        const auto& in_shape = node->input_value(0).get_partial_shape();
+        const auto& out_shape = node->get_output_partial_shape(0);
+        const bool is_mqa_fake_transpose = in_shape.rank().is_static() && in_shape.rank().get_length() == 4 &&
+                                           out_shape.rank().is_static() && out_shape.rank().get_length() == 4 &&
+                                           in_shape[0].compatible(out_shape[0]) &&  // B unchanged
+                                           in_shape[3].compatible(out_shape[3]) &&  // D unchanged
+                                           in_shape[1].compatible(out_shape[2]) &&  // Snew swapped to dim 2
+                                           in_shape[2].compatible(out_shape[1]) &&  // kv_heads swapped to dim 1
+                                           in_shape[2].is_static() && in_shape[2].get_length() == 1;  // kv_heads==1
+        if (!is_mqa_fake_transpose) {
+            return nullptr;
+        }
+        LOG_DEBUG("MQA: matched 'transpose' is a Reshape (num_kv_heads==1); replacing with Transpose");
+        auto data_input = node->input_value(0);
+        auto placeholder_order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 1, 3});
+        auto new_transpose = std::make_shared<ov::op::v1::Transpose>(data_input, placeholder_order);
+        new_transpose->set_friendly_name(node->get_friendly_name());
+        ov::copy_runtime_info(node, new_transpose);
+        ov::replace_node(node, new_transpose);
+        return new_transpose;
+    }
+
+    // generic part of matchers, to transpose v-tensors, and concat
+    void transpose_v_cache(Context::Ref ctx,
+                           const std::shared_ptr<ov::op::v0::Parameter>& matched_param,
+                           const std::shared_ptr<ov::op::v0::Concat>& matched_concat,
+                           const std::shared_ptr<ov::op::v1::Transpose>& matched_transpose) {
         // NB: The same param->concat pair may be matched multiple times when the
         // V-concat output feeds more than one downstream branch (e.g. shared KV-cache
         // across attention layers in Gemma4).  Guard the shared-state mutations so they
-        // are applied exactly once; per-branch matmul transpose_b is always set.
+        // are applied exactly once.
         if (matched_concat->get_axis() != 3u) {
             if (ctx.get().transposed_params.insert(matched_param.get()).second) {
                 auto param_shape = matched_param->get_partial_shape();
@@ -113,8 +150,17 @@ protected:
             ctx.get().track(matched_transpose->output(0));
         }
         ctx.get().track(matched_concat->output(0));
-        matched_matmul->set_transpose_b(true);
         ctx.get().bTransposed = true;
+    }
+
+    // to transpose v-tensors, and concat, and update matmul args; per-branch matmul transpose_b is always set
+    void transpose_matmul_b(Context::Ref ctx,
+                            const std::shared_ptr<ov::op::v0::Parameter>& matched_param,
+                            const std::shared_ptr<ov::op::v0::Concat>& matched_concat,
+                            const std::shared_ptr<ov::op::v1::Transpose>& matched_transpose,
+                            const std::shared_ptr<ov::op::v0::MatMul>& matched_matmul) {
+        transpose_v_cache(ctx, matched_param, matched_concat, matched_transpose);
+        matched_matmul->set_transpose_b(true);
     }
 
     void transpose_matmul_b(Context::Ref ctx,
@@ -296,36 +342,9 @@ private:
             auto matched_node_broadcast = node_to_output.at(broadcast).get_node_shared_ptr();
             auto matched_node_reshape = node_to_output.at(reshape).get_node_shared_ptr();
 
-            // MQA: Replace it with a
-            // real Transpose so that transpose_matmul_b can set the permutation order
-            // uniformly.  The placeholder order {0,2,1,3} will be overwritten to
-            // {0,2,3,1} by transpose_matmul_b.
-            if (ov::is_type<ov::op::v1::Reshape>(matched_node_transpose)) {
-                // Only accept a Reshape that is semantically a genuine MQA fake-transpose:
-                //   [B, Snew, 1, D] → [B, 1, Snew, D]
-                // i.e. 4D→4D, axes 1 and 2 are swapped, and the swapped-out dim equals 1
-                // (num_kv_heads==1).  Any other Reshape (e.g. 3D→4D in negative tests)
-                // must be rejected so the matcher does not fire.
-                const auto& in_shape = matched_node_transpose->input_value(0).get_partial_shape();
-                const auto& out_shape = matched_node_transpose->get_output_partial_shape(0);
-                const bool is_mqa_fake_transpose =
-                    in_shape.rank().is_static() && in_shape.rank().get_length() == 4 && out_shape.rank().is_static() &&
-                    out_shape.rank().get_length() == 4 && in_shape[0].compatible(out_shape[0]) &&  // B unchanged
-                    in_shape[3].compatible(out_shape[3]) &&                                        // D unchanged
-                    in_shape[1].compatible(out_shape[2]) &&                    // Snew swapped to dim 2
-                    in_shape[2].compatible(out_shape[1]) &&                    // kv_heads swapped to dim 1
-                    in_shape[2].is_static() && in_shape[2].get_length() == 1;  // kv_heads==1
-                if (!is_mqa_fake_transpose) {
-                    return false;
-                }
-                LOG_DEBUG("GQA: matched 'transpose' is a Reshape (num_kv_heads==1); replacing with Transpose");
-                auto data_input = matched_node_transpose->input_value(0);
-                auto placeholder_order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 1, 3});
-                auto new_transpose = std::make_shared<ov::op::v1::Transpose>(data_input, placeholder_order);
-                new_transpose->set_friendly_name(matched_node_transpose->get_friendly_name());
-                ov::copy_runtime_info(matched_node_transpose, new_transpose);
-                ov::replace_node(matched_node_transpose, new_transpose);
-                matched_node_transpose = new_transpose;
+            matched_node_transpose = to_real_transpose(matched_node_transpose);
+            if (!matched_node_transpose) {
+                return false;
             }
 
             auto matched_param = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_param);
@@ -367,6 +386,185 @@ private:
             return true;
         };
         register_matcher(std::make_shared<opp::Matcher>(matmul, "TransposeValueTensors_GQA"), std::move(callback));
+    }
+};
+
+// Keeps SDPA intact: V-tensors are transposed the same way as in the MHA/GQA patterns, and an explicit
+// Transpose right before SDPA.V restores the [B, H, S, D] layout that SDPA expects. The GQA broadcast
+// chain works on the transposed layout, so the Transpose stays adjacent to SDPA (where the compiler can
+// fuse it into the attention kernel, and the SDPAToPagedAttention pattern can match it):
+//   param -> [convert] -> concat -> [unsqueeze -> broadcast -> reshape] -> Transpose{0,1,3,2} -> SDPA.V
+class TransposeValueTensors_SDPA : public TransposeValueTensors {
+    static std::shared_ptr<ov::Node> make_restore(const ov::Output<ov::Node>& input, const std::string& name) {
+        auto order_cst = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 1, 3, 2});
+        auto restore = std::make_shared<ov::op::v1::Transpose>(input, order_cst);
+        restore->set_friendly_name(name + "/vt_restore");
+        ov::copy_runtime_info(input.get_node_shared_ptr(), restore);
+        return restore;
+    }
+
+    static bool has_single_consumer(const ov::Node* node) {
+        return node->get_output_size() == 1u && node->output(0).get_target_inputs().size() == 1u;
+    }
+
+    // Target shape with the last two dims swapped, nullptr if it can't be done. A computed target gets a
+    // Gather on top (a ShapeOf of the V-concat inside it is restored by restore_shape_of_consumers()).
+    static std::shared_ptr<ov::Node> swap_last_dims(const ov::Output<ov::Node>& target, bool special_zero) {
+        const auto& target_shape = target.get_partial_shape();
+        if (target_shape.rank() != ov::Rank(1) || target_shape[0].is_dynamic() || target_shape[0].get_length() < 2) {
+            return nullptr;
+        }
+        const auto n = static_cast<size_t>(target_shape[0].get_length());
+        if (auto cst = ov::as_type_ptr<ov::op::v0::Constant>(target.get_node_shared_ptr())) {
+            auto dims = cst->cast_vector<int64_t>();
+            // NB: with special_zero 0 copies the input dim at the same index, so it can't be moved
+            if (special_zero && (dims[n - 1] == 0 || dims[n - 2] == 0)) {
+                return nullptr;
+            }
+            std::swap(dims[n - 1], dims[n - 2]);
+            return ov::op::v0::Constant::create(cst->get_element_type(), cst->get_shape(), dims);
+        }
+        if (special_zero) {  // positions of the 0s are unknown
+            return nullptr;
+        }
+        std::vector<int64_t> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::swap(order[n - 1], order[n - 2]);
+        auto gather = std::make_shared<ov::op::v8::Gather>(
+            target,
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{n}, order),
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+        gather->set_friendly_name(target.get_node()->get_friendly_name() + "/transposed_layout");
+        ov::copy_runtime_info(target.get_node_shared_ptr(), gather);
+        return gather;
+    }
+
+    // GQA/MQA: concat -> unsqueeze -> broadcast -> reshape. Keeps the chain on the transposed [.., D, S]
+    // layout (swaps the last two dims of the broadcast/reshape target shapes) and puts the restoring
+    // Transpose after the reshape. Returns false (the graph is untouched) if the chain doesn't fit.
+    static bool restore_after_broadcast(ov::Node* node) {
+        auto unsqueeze = ov::as_type<ov::op::v0::Unsqueeze>(node);
+        if (!unsqueeze || !has_single_consumer(unsqueeze) ||
+            unsqueeze->get_output_partial_shape(0).rank() != ov::Rank(5)) {
+            return false;
+        }
+        auto axes = ov::as_type<ov::op::v0::Constant>(unsqueeze->get_input_node_ptr(1));
+        if (!axes || ov::shape_size(axes->get_shape()) != 1u) {
+            return false;
+        }
+        auto axis = axes->cast_vector<int64_t>()[0];
+        if (axis < 0) {
+            axis += 5;
+        }
+        if (axis < 0 || axis > 2) {  // the last two dims (D, S) must stay the last two
+            return false;
+        }
+
+        auto broadcast =
+            ov::as_type<ov::op::util::BroadcastBase>(unsqueeze->output(0).get_target_inputs().begin()->get_node());
+        if (!broadcast || broadcast->get_input_size() != 2u || !has_single_consumer(broadcast)) {
+            return false;
+        }
+        const auto mode = broadcast->get_broadcast_spec().m_type;
+        if (mode != ov::op::BroadcastType::NUMPY && mode != ov::op::BroadcastType::BIDIRECTIONAL) {
+            return false;
+        }
+        auto new_broadcast_target = swap_last_dims(broadcast->input_value(1), false);
+
+        auto reshape = ov::as_type<ov::op::v1::Reshape>(broadcast->output(0).get_target_inputs().begin()->get_node());
+        if (!new_broadcast_target || !reshape || reshape->get_output_partial_shape(0).rank() != ov::Rank(4)) {
+            return false;
+        }
+        auto new_reshape_target = swap_last_dims(reshape->input_value(1), reshape->get_special_zero());
+        if (!new_reshape_target) {
+            return false;
+        }
+
+        broadcast->set_argument(1, new_broadcast_target);
+        reshape->set_argument(1, new_reshape_target);
+        auto restore = make_restore(reshape->output(0), reshape->get_friendly_name());
+        for (auto&& in : reshape->output(0).get_target_inputs()) {
+            if (in.get_node() != restore.get()) {
+                in.replace_source_output(restore);
+            }
+        }
+        return true;
+    }
+
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::TransposeValueTensors_SDPA");
+    TransposeValueTensors_SDPA(Context::Ref ctx) {
+        auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>();
+
+        auto callback = [=](ov::pass::pattern::Matcher& m) {
+            auto matched_sdpa = m.get_match_root();
+
+            // Walk back from SDPA.V through the optional GQA broadcast chain to the V-concat
+            auto v_node = matched_sdpa->input_value(2).get_node_shared_ptr();
+            if (ov::is_type<ov::op::v1::Reshape>(v_node)) {
+                v_node = v_node->input_value(0).get_node_shared_ptr();
+                if (!ov::is_type<ov::op::v1::Broadcast>(v_node) && !ov::is_type<ov::op::v3::Broadcast>(v_node)) {
+                    return false;
+                }
+                v_node = v_node->input_value(0).get_node_shared_ptr();
+                if (!ov::is_type<ov::op::v0::Unsqueeze>(v_node)) {
+                    return false;
+                }
+                v_node = v_node->input_value(0).get_node_shared_ptr();
+            }
+            auto matched_concat = ov::as_type_ptr<ov::op::v0::Concat>(v_node);
+            if (!matched_concat || matched_concat->get_input_size() != 2u) {
+                return false;
+            }
+
+            auto param_node = matched_concat->input_value(0).get_node_shared_ptr();
+            if (ov::is_type<ov::op::v0::Convert>(param_node)) {
+                param_node = param_node->input_value(0).get_node_shared_ptr();
+            }
+            auto matched_param = ov::as_type_ptr<ov::op::v0::Parameter>(param_node);
+            if (!matched_param || matched_param->get_partial_shape().size() != 4u) {
+                return false;
+            }
+
+            auto transpose_node = matched_concat->input_value(1).get_node_shared_ptr();
+            if (!ov::is_type<ov::op::v1::Transpose>(transpose_node) &&
+                !ov::is_type<ov::op::v1::Reshape>(transpose_node)) {
+                return false;
+            }
+            transpose_node = to_real_transpose(transpose_node);
+            if (!transpose_node) {
+                return false;
+            }
+            auto matched_transpose = std::static_pointer_cast<ov::op::v1::Transpose>(transpose_node);
+
+            transpose_v_cache(ctx, matched_param, matched_concat, matched_transpose);
+
+            // NB: Only Results (and Assigns) keep the transposed V-cache layout, all other consumers
+            // (incl. SDPAs sharing this concat) are fed with the restored layout: GQA broadcast chains get
+            // the Transpose at their end, anything else a shared one right after the concat.
+            // ShapeOf consumers are fixed by restore_shape_of_consumers() (the concat output is tracked).
+            std::shared_ptr<ov::Node> concat_restore;
+            for (auto&& in : matched_concat->output(0).get_target_inputs()) {
+                auto consumer = in.get_node();
+                if (ov::is_type<ov::op::v0::Result>(consumer) || ov::is_type<ov::op::v6::Assign>(consumer) ||
+                    ov::is_type<ov::op::v0::ShapeOf>(consumer) || ov::is_type<ov::op::v3::ShapeOf>(consumer)) {
+                    continue;
+                }
+                if (restore_after_broadcast(consumer)) {
+                    LOG_DEBUG("vtensors transposed: SDPA pattern, explicit transpose after the broadcast chain of "
+                              << consumer->get_friendly_name());
+                    continue;
+                }
+                if (!concat_restore) {
+                    concat_restore = make_restore(matched_concat->output(0), matched_concat->get_friendly_name());
+                    LOG_DEBUG("vtensors transposed: SDPA pattern, explicit transpose "
+                              << concat_restore->get_friendly_name());
+                }
+                in.replace_source_output(concat_restore);
+            }
+            return true;
+        };
+        register_matcher(std::make_shared<opp::Matcher>(sdpa, "TransposeValueTensors_SDPA"), std::move(callback));
     }
 };
 
@@ -500,14 +698,22 @@ bool ov::npuw::util::OptimizeValueTensors::run_on_model(const std::shared_ptr<ov
         }
     }
 
-    if (has_sdpa_with_sink) {
+    TransposeValueTensors::Context ctx;
+    const bool keep_sdpa = !m_decompose_sdpa && !m_is_whisper && !has_sdpa_with_sink;
+    if (!m_decompose_sdpa && !keep_sdpa) {
+        LOG_WARN("NPUW_LLM_DECOMPOSE_SDPA=NO is not supported for " << (m_is_whisper ? "Whisper" : "SDPA with sink")
+                                                                    << ", SDPA will be decomposed");
+    }
+
+    if (keep_sdpa) {
+        rewr.add_matcher<TransposeValueTensors_SDPA>(std::ref(ctx));
+    } else if (has_sdpa_with_sink) {
         // TODO:  evaluate performance by older npu-drivers
         rewr.add_matcher<ov::pass::ScaledDotProductAttentionDecomposition>();
     } else {
         rewr.add_matcher<ScaledDotProductAttentionDecomposition>(m_is_prefill);
     }
 
-    TransposeValueTensors::Context ctx;
     rewr.add_matcher<TransposeValueTensors_MHA>(std::ref(ctx));
     rewr.add_matcher<TransposeValueTensors_GQA>(std::ref(ctx));
     if (m_is_whisper) {

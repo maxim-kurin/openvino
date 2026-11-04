@@ -3,6 +3,7 @@
 //
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <common_test_utils/test_common.hpp>
 
 #include "intel_npu/config/config.hpp"
@@ -832,4 +833,199 @@ TEST(TransposeVTShapeComputeTest, smoke_WhisperPrefill_ShapeOfTranspose) {
 
     ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, true).run_on_model(model));
     expect_shape_results(model, ov::ParameterVector{value, scores}, {{B, H, S, D}});
+}
+
+// NPUW_LLM_DECOMPOSE_SDPA=NO: SDPA ops are kept, the V-cache is transposed as usual and
+// an explicit Transpose{0,1,3,2} right before SDPA.V restores the layout SDPA expects.
+namespace {
+
+template <class Op>
+size_t count_ops(const std::shared_ptr<ov::Model>& model) {
+    const auto ops = model->get_ops();
+    return std::count_if(ops.begin(), ops.end(), [](const auto& op) {
+        return ov::is_type<Op>(op);
+    });
+}
+
+std::vector<int64_t> transpose_order(const ov::Node* node) {
+    if (!ov::is_type<ov::op::v1::Transpose>(node)) {
+        return {};
+    }
+    return ov::as_type<ov::op::v0::Constant>(node->get_input_node_ptr(1))->cast_vector<int64_t>();
+}
+
+// The first model parameter is the past V, feeding the V-concat
+void check_v_restored(const std::shared_ptr<ov::Model>& model, ov::Shape orig_past_shape) {
+    EXPECT_EQ(count_ops<ov::op::v8::Softmax>(model), 0u) << "SDPA should not be decomposed";
+
+    const auto& past_value = model->get_parameters()[0];
+    std::swap(orig_past_shape[2], orig_past_shape[3]);
+    EXPECT_EQ(past_value->get_partial_shape(), ov::PartialShape(orig_past_shape));
+
+    auto concat = ov::as_type<ov::op::v0::Concat>(past_value->output(0).get_target_inputs().begin()->get_node());
+    ASSERT_NE(concat, nullptr);
+    EXPECT_EQ(concat->get_axis(), 3);
+    EXPECT_EQ(transpose_order(concat->get_input_node_ptr(1)), (std::vector<int64_t>{0, 2, 3, 1}));
+
+    // every SDPA.V is fed by the restoring Transpose directly
+    for (const auto& op : model->get_ops()) {
+        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
+            EXPECT_EQ(transpose_order(op->get_input_node_ptr(2)), (std::vector<int64_t>{0, 1, 3, 2}))
+                << op->get_friendly_name();
+        }
+    }
+}
+
+std::vector<std::vector<int64_t>> concat_consumer_orders(const std::shared_ptr<ov::Model>& model) {
+    const auto& past_value = model->get_parameters()[0];
+    auto concat = past_value->output(0).get_target_inputs().begin()->get_node();
+    std::vector<std::vector<int64_t>> orders;
+    for (const auto& in : concat->output(0).get_target_inputs()) {
+        if (!ov::is_type<ov::op::v0::Result>(in.get_node())) {
+            orders.push_back(transpose_order(in.get_node()));
+        }
+    }
+    return orders;
+}
+
+constexpr size_t B = 1, H = 4, S = 8, D = 64;
+
+//   past_value[1,4,8,64]   new_v[1,1,4,64] -> transpose{0,2,1,3}
+//        +------concat(axis=2)[1,4,9,64]----> present_value
+//                      |
+//                    SDPA.V
+std::shared_ptr<ov::Model> build_mha_sdpa_model() {
+    auto past_value = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, H, S, D});
+    auto new_v = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, 1, H, D});
+    auto q = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, H, 1, D});
+    auto k = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, H, S + 1, D});
+    auto mask = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, 1, 1, S + 1});
+
+    auto order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 1, 3});
+    auto transpose = std::make_shared<ov::op::v1::Transpose>(new_v, order);
+    auto concat = std::make_shared<ov::op::v0::Concat>(ov::NodeVector{past_value, transpose}, 2);
+    auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, concat, mask, false);
+
+    return std::make_shared<ov::Model>(
+        ov::ResultVector{std::make_shared<ov::op::v0::Result>(sdpa), std::make_shared<ov::op::v0::Result>(concat)},
+        ov::ParameterVector{past_value, new_v, q, k, mask});
+}
+
+}  // namespace
+
+TEST(TransposeVTKeepSDPATest, smoke_MHA_SDPA_ExplicitTranspose) {
+    auto model = build_mha_sdpa_model();
+    ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, false, false).run_on_model(model));
+
+    EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(model), 1u);
+    check_v_restored(model, {B, H, S, D});
+    // the concat feeds Results and a single restoring Transpose
+    EXPECT_EQ(concat_consumer_orders(model), (std::vector<std::vector<int64_t>>{{0, 1, 3, 2}}));
+}
+
+namespace {
+
+constexpr size_t KV = 1, QH = 8, N = 4;
+
+struct MQAModel {
+    std::shared_ptr<ov::Model> model;
+    std::shared_ptr<ov::Node> unsqueeze, broadcast, reshape;
+};
+
+// Gemma4-like: MQA (Reshape as a fake transpose), GQA broadcast chain shared by two SDPAs.
+//
+//   past_value[1,1,8,64]   new_v[1,4,1,64] -> Reshape (fake transpose) [1,1,4,64]
+//        +------concat(axis=2)[1,1,12,64]----> present_value
+//                      |
+//         unsqueeze -> broadcast[1,1,8,12,64] -> reshape[1,8,12,64]
+//                                                 |            |
+//                                               SDPA1.V      SDPA2.V
+MQAModel build_mqa_shared_sdpa_model(const std::vector<int64_t>& reshape_target,
+                                     bool special_zero,
+                                     bool extra_broadcast_consumer = false) {
+    auto past_value = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, KV, S, D});
+    auto new_v = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, N, KV, D});
+    auto fake_transpose = std::make_shared<ov::op::v1::Reshape>(
+        new_v,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {B, KV, N, D}),
+        false);
+    auto concat = std::make_shared<ov::op::v0::Concat>(ov::NodeVector{past_value, fake_transpose}, 2);
+
+    auto unsqueeze =
+        std::make_shared<ov::op::v0::Unsqueeze>(concat, ov::op::v0::Constant::create(ov::element::i64, {1}, {2}));
+    auto broadcast = std::make_shared<ov::op::v3::Broadcast>(
+        unsqueeze,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5}, {B, KV, QH, S + N, D}),
+        ov::op::BroadcastType::BIDIRECTIONAL);
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(
+        broadcast,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, reshape_target),
+        special_zero);
+
+    ov::ParameterVector params{past_value, new_v};
+    ov::ResultVector results{std::make_shared<ov::op::v0::Result>(concat)};
+    if (extra_broadcast_consumer) {
+        results.push_back(std::make_shared<ov::op::v0::Result>(broadcast));
+    }
+    for (int i = 0; i < 2; ++i) {
+        auto q = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, QH, N, D});
+        auto k = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, QH, S + N, D});
+        auto mask = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, 1, N, S + N});
+        auto scale = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {1.0f});
+        auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, reshape, mask, scale, false);
+        params.insert(params.end(), {q, k, mask});
+        results.push_back(std::make_shared<ov::op::v0::Result>(sdpa));
+    }
+    return {std::make_shared<ov::Model>(results, params), unsqueeze, broadcast, reshape};
+}
+
+std::vector<int64_t> const_values(ov::Node* node) {
+    return ov::as_type<ov::op::v0::Constant>(node)->cast_vector<int64_t>();
+}
+
+}  // namespace
+
+// The broadcast chain runs on the transposed layout, the restoring Transpose sits right before both SDPAs
+TEST(TransposeVTKeepSDPATest, smoke_MQA_SharedSDPA_TransposeBeforeSDPA) {
+    for (bool special_zero : {false, true}) {
+        SCOPED_TRACE(special_zero);
+        auto target = special_zero ? std::vector<int64_t>{0, QH, -1, D} : std::vector<int64_t>{B, QH, S + N, D};
+        auto m = build_mqa_shared_sdpa_model(target, special_zero);
+
+        ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, false, false).run_on_model(m.model));
+
+        EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(m.model), 2u);
+        check_v_restored(m.model, {B, KV, S, D});
+        EXPECT_TRUE(ov::is_type<ov::op::v0::Concat>(m.unsqueeze->get_input_node_ptr(0)));
+        EXPECT_EQ(const_values(m.broadcast->get_input_node_ptr(1)),
+                  (std::vector<int64_t>{B, KV, QH, D, S + N}));
+        std::swap(target[2], target[3]);
+        EXPECT_EQ(const_values(m.reshape->get_input_node_ptr(1)), target);
+        EXPECT_EQ(m.reshape->get_output_partial_shape(0), ov::PartialShape({B, QH, D, S + N}));
+        // a single restoring Transpose shared by both SDPAs
+        EXPECT_EQ(count_ops<ov::op::v1::Transpose>(m.model), 2u);  // + the new-V one
+        for (const auto& in : m.reshape->output(0).get_target_inputs()) {
+            EXPECT_EQ(transpose_order(in.get_node()), (std::vector<int64_t>{0, 1, 3, 2}));
+        }
+    }
+}
+
+// The broadcast output has another consumer, so the chain can't change its layout: it is kept as is
+// and the restoring Transpose goes right after the concat
+TEST(TransposeVTKeepSDPATest, smoke_MQA_SharedSDPA_FallbackTransposeAfterConcat) {
+    auto m = build_mqa_shared_sdpa_model({B, QH, S + N, D}, false, true);
+    ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, false, false).run_on_model(m.model));
+
+    EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(m.model), 2u);
+    EXPECT_EQ(concat_consumer_orders(m.model), (std::vector<std::vector<int64_t>>{{0, 1, 3, 2}}));
+    EXPECT_EQ(const_values(m.broadcast->get_input_node_ptr(1)), (std::vector<int64_t>{B, KV, QH, S + N, D}));
+    EXPECT_EQ(m.reshape->get_output_partial_shape(0), ov::PartialShape({B, QH, S + N, D}));
+}
+
+// Whisper and SDPA with sink are not supported in the keep-SDPA mode: decomposition is used instead
+TEST(TransposeVTKeepSDPATest, smoke_Whisper_FallsBackToDecomposition) {
+    auto model = build_mha_sdpa_model();
+    ASSERT_NO_THROW(ov::npuw::util::OptimizeValueTensors(false, true, false).run_on_model(model));
+
+    EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(model), 0u);
 }
