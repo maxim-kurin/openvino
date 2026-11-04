@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <tuple>
 
 #include "embedding/redirect_new_kv_to_output.hpp"
@@ -115,6 +116,22 @@ TEST_F(OptimizeValueTensorsPassTest, SDPAOpsRemainsWhenOptimizationDisabled) {
     const auto& generate = require_sub_model_containing(recorder, "_kv");
 
     EXPECT_GT(count_ops<ov::op::v13::ScaledDotProductAttention>(generate.model), 0u);
+}
+
+// PYRAMID attention supports the decomposed SDPA only: it is decomposed even with NPUW_LLM_DECOMPOSE_SDPA=NO
+TEST_F(OptimizeValueTensorsPassTest, PyramidAttentionForcesSDPADecomposition) {
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    ASSERT_NO_THROW(compiled = create_compiled_model({{"NPUW_LLM_OPTIMIZE_V_TENSORS", "YES"},
+                                                      {"NPUW_LLM_DECOMPOSE_SDPA", "NO"},
+                                                      {"NPUW_LLM_GENERATE_ATTENTION_HINT", "PYRAMID"}},
+                                                     recorder));
+    ASSERT_NE(compiled, nullptr);
+
+    const auto& generate = require_sub_model_containing(recorder, "_kv");
+    EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(generate.model), 0u);
+    EXPECT_GE(count_ops<ov::op::v8::Softmax>(generate.model), 2u);
 }
 
 // TransposeValueTensors sets transpose_b=true on the value-multiplication MatMul
@@ -444,5 +461,49 @@ TEST_P(OptimizeValueTensorsDynamicShapeTest, ShapeQueriesPreserveRuntimeDimensio
 INSTANTIATE_TEST_SUITE_P(ShapeOfVersions,
                          OptimizeValueTensorsDynamicShapeTest,
                          ::testing::Combine(::testing::Bool(), ::testing::Bool(), ::testing::Values(0, 1, 2)));
+
+// NPUW_LLM_DECOMPOSE_SDPA=NO keeps SDPA ops, the V-cache layout is still transposed and an
+// explicit Transpose{0,1,3,2} restores the layout SDPA expects.
+class OptimizeValueTensorsKeepSDPATest : public ov::test::npuw::LLMPassTestFixture,
+                                         public ::testing::WithParamInterface<std::tuple<std::string, bool>> {};
+
+INSTANTIATE_TEST_SUITE_P(SubModels,
+                         OptimizeValueTensorsKeepSDPATest,
+                         ::testing::Combine(::testing::Values(std::string{"_prefill"}, std::string{"_kv"}),
+                                            ::testing::Bool()),
+                         [](const ::testing::TestParamInfo<std::tuple<std::string, bool>>& info) {
+                             auto name = std::get<0>(info.param).substr(1);
+                             return name + (std::get<1>(info.param) ? "_GQA" : "_MHA");
+                         });
+
+TEST_P(OptimizeValueTensorsKeepSDPATest, SDPAKeptWithExplicitVTranspose) {
+    const auto& [fragment, gqa] = GetParam();
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    auto model = gqa ? ov::test::npuw::build_llm_gqa_test_model() : ov::test::npuw::build_llm_test_model();
+    ASSERT_NO_THROW(compiled = create_compiled_model(model,
+                                                     {{"NPUW_LLM_OPTIMIZE_V_TENSORS", "YES"},
+                                                      {"NPUW_LLM_DECOMPOSE_SDPA", "NO"},
+                                                      {"NPUW_LLM_PREFILL_ATTENTION_HINT", "STATIC"}},
+                                                     recorder));
+    ASSERT_NE(compiled, nullptr);
+
+    const auto& sub = require_sub_model_containing(recorder, fragment);
+    EXPECT_GT(count_ops<ov::op::v13::ScaledDotProductAttention>(sub.model), 0u);
+    EXPECT_EQ(count_ops<ov::op::v8::Softmax>(sub.model), 0u);
+
+    // The restoring Transpose sits right before SDPA.V (after the GQA broadcast chain, if any)
+    for (const auto& op : sub.model->get_ops()) {
+        if (!ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
+            continue;
+        }
+        auto v = op->get_input_node_shared_ptr(2);
+        ASSERT_TRUE(ov::is_type<ov::op::v1::Transpose>(v)) << op->get_friendly_name();
+        auto order = ov::as_type_ptr<ov::op::v0::Constant>(v->get_input_node_shared_ptr(1));
+        ASSERT_NE(order, nullptr);
+        EXPECT_EQ(order->cast_vector<int64_t>(), (std::vector<int64_t>{0, 1, 3, 2})) << op->get_friendly_name();
+    }
+}
 
 }  // namespace
