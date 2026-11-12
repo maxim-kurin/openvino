@@ -21,6 +21,7 @@
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/pass/pattern/op/label.hpp"
 #include "openvino/pass/pattern/op/optional.hpp"
+#include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 
 namespace ov {
@@ -62,15 +63,6 @@ bool has_param_past_inputs(const std::shared_ptr<ov::op::v0::Concat>& concat) {
     }
 
     return std::all_of(params.begin(), params.end(), is_past_kv_param);
-}
-
-// Transpose restoring the transposed V-cache layout before SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO), the only consumer
-// of the Reshape: SharedOpOptimization (run by Model::reshape) merges the per-SDPA Transposes into one.
-std::shared_ptr<ov::op::v1::Transpose> find_v_restore(const ov::Output<ov::Node>& reshape_output) {
-    const auto& targets = reshape_output.get_target_inputs();
-    if (targets.size() != 1)
-        return nullptr;
-    return ov::as_type_ptr<ov::op::v1::Transpose>(targets.begin()->get_node()->shared_from_this());
 }
 
 struct KVBroadcastChain {
@@ -151,24 +143,32 @@ DuplicateSharedKVConcat::DuplicateSharedKVConcat() {
     // Pattern: Concat(past-KV params…, current_KV)
     //              → [optional Unsqueeze]
     //              → [optional Broadcast (v1 or v3)]
-    //              → Reshape  ← anchored here; predicate checks fan-out and consumer types
-    //              → [Transpose restoring the V-cache layout, see find_v_restore()]
+    //              → Reshape
+    //              → [Transpose restoring the transposed V-cache layout before SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO);
+    //                 the per-SDPA Transposes are merged into one by SharedOpOptimization, which runs in the
+    //                 PrePostProcessor build() of ConvertKVCacheToPrecision]
+    // The root is the last node of the chain, it must fan out to several MatMul/SDPA consumers.
+    const auto fans_out_to_attention = [](const ov::Output<ov::Node>& output) {
+        const auto& targets = output.get_target_inputs();
+        if (targets.size() <= 1)
+            return false;
+        for (const auto& ti : targets) {
+            auto* n = ti.get_node();
+            if (!ov::is_type<ov::op::v0::MatMul>(n) && !ov::is_type<ov::op::v13::ScaledDotProductAttention>(n))
+                return false;
+        }
+        return true;
+    };
     auto p_concat = opp::wrap_type<ov::op::v0::Concat>();
     auto p_unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({p_concat, opp::any_input()});
     auto p_broadcast = opp::optional<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({p_unsqueeze, opp::any_input()});
-    auto p_reshape =
-        opp::wrap_type<ov::op::v1::Reshape>({p_broadcast, opp::any_input()}, [](const ov::Output<ov::Node>& output) {
-            const auto v_restore = find_v_restore(output);
-            const auto& targets = v_restore ? v_restore->output(0).get_target_inputs() : output.get_target_inputs();
-            if (targets.size() <= 1)
-                return false;
-            for (const auto& ti : targets) {
-                auto* n = ti.get_node();
-                if (!ov::is_type<ov::op::v0::MatMul>(n) && !ov::is_type<ov::op::v13::ScaledDotProductAttention>(n))
-                    return false;
-            }
-            return true;
-        });
+    auto p_reshape = opp::wrap_type<ov::op::v1::Reshape>({p_broadcast, opp::any_input()}, fans_out_to_attention);
+    auto p_reshape_for_v_restore =
+        opp::wrap_type<ov::op::v1::Reshape>({p_broadcast, opp::any_input()}, opp::consumers_count(1));
+    auto p_v_restore =
+        opp::wrap_type<ov::op::v1::Transpose>({p_reshape_for_v_restore, opp::any_input()}, fans_out_to_attention);
+    using ov::pass::operator|;
+    auto p_root = p_v_restore | p_reshape;
 
     // Note: Use [=] to keep pattern nodes alive in the callback.
     auto callback = [=](ov::pass::pattern::Matcher& m) {
@@ -179,8 +179,12 @@ DuplicateSharedKVConcat::DuplicateSharedKVConcat() {
             return false;
 
         KVBroadcastChain chain;
-        chain.reshape = ov::as_type_ptr<ov::op::v1::Reshape>(vm.at(p_reshape).get_node_shared_ptr());
-        chain.v_restore = find_v_restore(chain.reshape->output(0));
+        if (vm.count(p_v_restore)) {
+            chain.v_restore = ov::as_type_ptr<ov::op::v1::Transpose>(vm.at(p_v_restore).get_node_shared_ptr());
+            chain.reshape = ov::as_type_ptr<ov::op::v1::Reshape>(vm.at(p_reshape_for_v_restore).get_node_shared_ptr());
+        } else {
+            chain.reshape = ov::as_type_ptr<ov::op::v1::Reshape>(vm.at(p_reshape).get_node_shared_ptr());
+        }
         chain.concat = matched_concat;
 
         // opp::optional nodes are absent from vm when not matched (pass-through case).
@@ -203,15 +207,16 @@ DuplicateSharedKVConcat::DuplicateSharedKVConcat() {
 
         const size_t fan_out =
             (chain.v_restore ? chain.v_restore->output(0) : chain.reshape->output(0)).get_target_inputs().size();
-        LOG_DEBUG("DuplicateSharedKVConcat: Reshape \""
-                  << chain.reshape->get_friendly_name() << "\" fan-out=" << fan_out
+        LOG_DEBUG("DuplicateSharedKVConcat: \""
+                  << (chain.v_restore ? chain.v_restore->get_friendly_name() : chain.reshape->get_friendly_name())
+                  << "\" fan-out=" << fan_out
                   << " — duplicating KV broadcast chain for " << (fan_out - 1) << " extra consumer(s)");
 
         duplicate_for_extra_consumers(chain);
         return true;
     };
 
-    register_matcher(std::make_shared<opp::Matcher>(p_reshape, "DuplicateSharedKVConcat"), std::move(callback));
+    register_matcher(std::make_shared<opp::Matcher>(p_root, "DuplicateSharedKVConcat"), std::move(callback));
 }
 
 }  // namespace pass

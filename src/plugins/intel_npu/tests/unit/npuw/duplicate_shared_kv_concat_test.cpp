@@ -238,6 +238,30 @@ TEST_F(DuplicateSharedKVConcatTest, GQA_VRestoreTranspose_FanOut3) {
     EXPECT_EQ(concats.size(), 3u);
 }
 
+// ─── No-op: the Reshape feeding the V-restore Transpose has another consumer ─
+
+TEST_F(DuplicateSharedKVConcatTest, NoOp_VRestoreReshapeWithExtraConsumer) {
+    auto model = build_fanout_model("past_key_values.0.value",
+                                    {1, 2, 8, 4},
+                                    3,
+                                    /*fan_out=*/3,
+                                    /*with_gqa=*/true,
+                                    /*with_v_restore=*/true);
+    std::shared_ptr<ov::op::v1::Reshape> reshape;
+    for (const auto& op : model->get_ops()) {
+        if (auto r = ov::as_type_ptr<ov::op::v1::Reshape>(op)) {
+            reshape = r;
+        }
+    }
+    ASSERT_NE(reshape, nullptr);
+    model->add_results({std::make_shared<ov::op::v0::Result>(reshape)});
+
+    // The chain is not owned by the attention consumers, so it must not be duplicated
+    EXPECT_FALSE(run_pass(model));
+    EXPECT_EQ(count_ops<ov::op::v0::Concat>(model), 1u);
+    EXPECT_EQ(count_ops<ov::op::v1::Transpose>(model), 1u);
+}
+
 // ─── Integration: SplitKVCacheIntoBlocks → DuplicateSharedKVConcat ───────────
 // Block param names (_block_0, _block_1, …) must still be recognised.
 
