@@ -143,8 +143,8 @@ void expect_v_cache_transposed(const std::shared_ptr<ov::Model>& model) {
     EXPECT_GT(checked, 0u);
 }
 
-// PYRAMID and HFA attention support the kept SDPA, so NPUW_LLM_DECOMPOSE_SDPA=NO keeps it with them too.
-// The prefill model uses them with chunked prefill only.
+// NPUW_LLM_DECOMPOSE_SDPA=NO keeps the SDPA whichever attention hint is set. The sub-models are
+// mocked here, so this doesn't build PYRAMID/HFA: see KeptSDPACompilesTo* in subgraph_behavior_infer_test.cpp.
 struct AttentionHintCase {
     std::string name;
     ov::AnyMap props;
@@ -177,7 +177,7 @@ INSTANTIATE_TEST_SUITE_P(
         return info.param.name;
     });
 
-TEST_P(OptimizeValueTensorsAttentionHintTest, SDPAKeptForPyramidAndHFA) {
+TEST_P(OptimizeValueTensorsAttentionHintTest, SDPAKeptWithAttentionHint) {
     const auto& param = GetParam();
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;

@@ -896,6 +896,43 @@ TEST_F(SubgraphBehaviorInferTest, PyramidBehaviorBindsOnlyActiveVariantPorts) {
     EXPECT_NO_THROW(request->infer());
 }
 
+// NPUW_LLM_DECOMPOSE_SDPA=NO end to end: the real OptimizeValueTensors output keeping SDPA with a
+// transposed V-cache must be isolated as ATTN and compiled into a pyramid / HFA, not silently fall back.
+class KeptSDPAAttentionTest : public SubgraphBehaviorInferTest, public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(KeptSDPAAttentionTest, KeptSDPACompilesToAttentionMode) {
+    const auto& attn_mode = GetParam();
+    auto model = ov::test::npuw::build_dynamic_attention_llm_model();
+    ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, false, /*decompose_sdpa=*/false).run_on_model(model));
+    ov::npuw::RedirectNewKvToOutput().run_on_model(model);
+    ASSERT_GT(count_sdpa_nodes(model), 0u) << "SDPA must be kept";
+
+    auto plugin = std::make_shared<TestPlugin>();
+    auto core = make_core(plugin, /*own_ports_only=*/true);
+    plugin->set_core(core);
+
+    auto props = base_props();
+    props["NPUW_ATTN"] = attn_mode;
+    props["NPUW_FALLBACK_EXEC"] = std::string("NO");
+    auto compiled = std::make_shared<ov::npuw::CompiledModel>(model, plugin, props);
+
+    std::size_t num_attention = 0u;
+    for (const auto& desc : compiled->m_compiled_submodels) {
+        const bool built = attn_mode == "PYRAMID"
+                               ? ov::npuw::attn::get_compiled_pyramid(desc.pipeline.context) != nullptr
+                               : ov::npuw::attn::get_compiled_hfa(desc.pipeline.context) != nullptr;
+        num_attention += built ? 1u : 0u;
+    }
+    EXPECT_GT(num_attention, 0u) << "No " << attn_mode << " attention was built for the kept SDPA";
+}
+
+INSTANTIATE_TEST_SUITE_P(KeptSDPA,
+                         KeptSDPAAttentionTest,
+                         ::testing::Values(std::string("PYRAMID"), std::string("HFA")),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                             return info.param;
+                         });
+
 // The history size reaches the base infer request only through the npuw_history_size variable
 // state, which a caller holding nothing but the public request can find via query_state().
 // Dynamic attention uses it to pick the pyramid variant for a prefill chunk, so driving that
