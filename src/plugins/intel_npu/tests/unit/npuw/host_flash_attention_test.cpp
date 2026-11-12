@@ -917,8 +917,11 @@ TEST(HostFlashAttentionHistorySizeTest, GenerateTakesHistoryAsIs) {
 namespace {
 
 enum class KeptSDPAScale { Constant, Absent, Parameter };
+// Additive float mask, causal flag (the mask input is ignored by SDPA) or boolean mask
+enum class KeptSDPAMask { Additive, Causal, Boolean };
 
-std::shared_ptr<ov::Model> build_kept_sdpa_model(KeptSDPAScale scale_kind = KeptSDPAScale::Constant) {
+std::shared_ptr<ov::Model> build_kept_sdpa_model(KeptSDPAScale scale_kind = KeptSDPAScale::Constant,
+                                                 KeptSDPAMask mask_kind = KeptSDPAMask::Additive) {
     using namespace ov;
 
     const size_t context_size = PAST_LEN + QUERY_SIZE;
@@ -934,7 +937,10 @@ std::shared_ptr<ov::Model> build_kept_sdpa_model(KeptSDPAScale scale_kind = Kept
     auto new_key = ov::test::utils::make_param(element::f32, q_shape, "new_key.0");
     auto new_val =
         ov::test::utils::make_param(element::f32, Shape{BATCH, NUM_HEADS, HEAD_DIM, QUERY_SIZE}, "new_value.0");
-    auto mask = ov::test::utils::make_param(element::f32, mask_shape, "mask.0");
+    auto mask = ov::test::utils::make_param(mask_kind == KeptSDPAMask::Boolean ? element::boolean : element::f32,
+                                            mask_shape,
+                                            "mask.0");
+    const bool causal = mask_kind == KeptSDPAMask::Causal;
     ParameterVector params = {query, past_key, past_val, new_key, new_val, mask};
 
     auto key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
@@ -949,16 +955,16 @@ std::shared_ptr<ov::Model> build_kept_sdpa_model(KeptSDPAScale scale_kind = Kept
     switch (scale_kind) {
     case KeptSDPAScale::Constant: {
         auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
-        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, false);
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, causal);
         break;
     }
     case KeptSDPAScale::Absent:
-        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, false);
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, causal);
         break;
     case KeptSDPAScale::Parameter: {
         auto scale = ov::test::utils::make_param(element::f32, Shape{}, "scale.0");
         params.push_back(scale);
-        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, false);
+        sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, val_restore, mask, scale, causal);
         break;
     }
     }
@@ -1057,6 +1063,21 @@ TEST(HostFlashAttentionKeptSDPATest, DecomposedModelDoesNotScaleQuery) {
 
 TEST(HostFlashAttentionKeptSDPATest, NonConstantScaleIsRejected) {
     EXPECT_FALSE(ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(KeptSDPAScale::Parameter), true)
+                     .has_value());
+}
+
+// HFA needs an explicit additive mask: a causal or boolean-mask kept SDPA is rejected, not mis-tiled
+TEST(HostFlashAttentionKeptSDPATest, CausalSDPAIsRejected) {
+    EXPECT_FALSE(
+        ov::npuw::function::HostFlashAttention::from(build_kept_sdpa_model(KeptSDPAScale::Constant, KeptSDPAMask::Causal),
+                                                     true)
+            .has_value());
+}
+
+TEST(HostFlashAttentionKeptSDPATest, BooleanMaskSDPAIsRejected) {
+    EXPECT_FALSE(ov::npuw::function::HostFlashAttention::from(
+                     build_kept_sdpa_model(KeptSDPAScale::Constant, KeptSDPAMask::Boolean),
+                     true)
                      .has_value());
 }
 

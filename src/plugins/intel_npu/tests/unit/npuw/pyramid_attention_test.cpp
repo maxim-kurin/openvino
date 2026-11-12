@@ -169,7 +169,11 @@ std::shared_ptr<ov::Model> build_reshaped_attention_model(size_t query_len, size
 // Kept-SDPA counterpart of build_isolated_attention_model (NPUW_LLM_DECOMPOSE_SDPA=NO): the V-cache is
 // stored transposed ([1, H, head_dim, seq], concat axis 3) and an explicit Transpose restores the
 // [1, H, seq, head_dim] layout SDPA expects.
-std::shared_ptr<ov::Model> build_isolated_kept_sdpa_model(const AttentionModelConfig& cfg) {
+// Additive float mask, causal flag (the mask input is ignored by SDPA) or boolean mask
+enum class KeptSDPAMask { Additive, Causal, Boolean };
+
+std::shared_ptr<ov::Model> build_isolated_kept_sdpa_model(const AttentionModelConfig& cfg,
+                                                          KeptSDPAMask mask_kind = KeptSDPAMask::Additive) {
     using namespace ov;
 
     const size_t context_len = cfg.past_len + cfg.query_len;
@@ -185,15 +189,21 @@ std::shared_ptr<ov::Model> build_isolated_kept_sdpa_model(const AttentionModelCo
     auto new_key = ov::test::utils::make_param(element::f32, new_token_shape, "new_key.0");
     auto new_value =
         ov::test::utils::make_param(element::f32, Shape{1, cfg.num_heads, cfg.head_dim, cfg.query_len}, "new_value.0");
-    auto mask = ov::test::utils::make_param(element::f32, Shape{1, 1, cfg.query_len, context_len}, "mask.0");
+    auto mask = ov::test::utils::make_param(mask_kind == KeptSDPAMask::Boolean ? element::boolean : element::f32,
+                                            Shape{1, 1, cfg.query_len, context_len},
+                                            "mask.0");
 
     auto key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
     auto value_concat = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 3);
     auto order = op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2});
     auto value_restore = std::make_shared<op::v1::Transpose>(value_concat, order);
     auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
-    auto sdpa =
-        std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, value_restore, mask, scale, false);
+    auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query,
+                                                                     key_concat,
+                                                                     value_restore,
+                                                                     mask,
+                                                                     scale,
+                                                                     mask_kind == KeptSDPAMask::Causal);
     sdpa->set_friendly_name("sdpa.0");
 
     ResultVector results;
@@ -1205,6 +1215,25 @@ TEST(PyramidAttentionTest, KeptSDPAFromKeepsSDPAInEveryPyramidModel) {
         EXPECT_EQ(sdpa_count, 1u) << "pyramid model " << i;
         EXPECT_EQ(pyramid->_attentions[i]._mask_shape, (ov::Shape{1, 1, 1, context})) << "pyramid model " << i;
     }
+}
+
+// Pyramid needs an explicit additive mask: a causal or boolean-mask kept SDPA is rejected
+TEST(PyramidAttentionTest, KeptSDPACausalIsRejected) {
+    AttentionModelConfig cfg;
+    cfg.query_len = 1;
+    cfg.past_len = 2047;
+    EXPECT_FALSE(
+        ov::npuw::function::PyramidAttention::from(build_isolated_kept_sdpa_model(cfg, KeptSDPAMask::Causal))
+            .has_value());
+}
+
+TEST(PyramidAttentionTest, KeptSDPABooleanMaskIsRejected) {
+    AttentionModelConfig cfg;
+    cfg.query_len = 1;
+    cfg.past_len = 2047;
+    EXPECT_FALSE(
+        ov::npuw::function::PyramidAttention::from(build_isolated_kept_sdpa_model(cfg, KeptSDPAMask::Boolean))
+            .has_value());
 }
 
 TEST(PyramidAttentionTest, KeptSDPAPrefillSpecializesRestoredValueReshapeSequenceAxis) {
