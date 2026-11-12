@@ -4,7 +4,6 @@
 
 #include "kv_cache_compressed.hpp"
 
-#include <algorithm>
 #include <limits>
 
 #include "../util.hpp"
@@ -401,14 +400,9 @@ void ov::npuw::run_kv_cache_dynamic_quantization_passes(const std::shared_ptr<ov
                                                         const KVCacheCompressionParams& params,
                                                         bool v_tensors_transposed) {
     //  Validate SDPA patterns and extract key nodes
+    // Both the decomposed and the intact SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO) are rewired: the
+    // dequantization only touches the past Parameter -> Concat edge, not the attention itself.
     auto pattern_nodes_list = ov::npuw::util::find_all_sdpa_pattern_nodes(model);
-    // Past-cache dequantization rewiring supports the decomposed SDPA only, skip intact SDPAs
-    pattern_nodes_list.erase(std::remove_if(pattern_nodes_list.begin(),
-                                            pattern_nodes_list.end(),
-                                            [](const ov::npuw::util::SDPAPatternNodes& p) {
-                                                return p.sdpa_node != nullptr;
-                                            }),
-                             pattern_nodes_list.end());
 
     if (pattern_nodes_list.empty()) {
         LOG_WARN("Failed to find SDPA pattern nodes in model "

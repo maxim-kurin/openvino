@@ -30,7 +30,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <map>
 #include <random>
 #include <regex>
 #include <unordered_map>
@@ -40,13 +42,16 @@
 #include "openvino/core/preprocess/pre_post_process.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
+#include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reduce_min.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/softmax.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/openvino.hpp"
 #include "ov_ops/dynamic_quantize.hpp"
 
@@ -304,23 +309,28 @@ TEST(KVCacheCompressionPassRegressionTest, NonTransposedValueUsesEmbeddingReduct
     EXPECT_EQ(value_reduce_axis_count, 1u);
 }
 
-// An intact SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO, DYNAMIC attention) is not rewired with past-cache
-// dequantization: only the decomposed SDPA form is supported, so no scale/zp Parameters are added.
-TEST(KVCacheCompressionPassRegressionTest, IntactSDPAIsNotRewired) {
-    const Shape kv_shape{1, 4, 8, 16};
+// An intact SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO) is rewired with past-cache dequantization like the
+// decomposed one: the generate model always has a past cache, which PPP stores as integers.
+// The V-cache is transposed ([1, heads, head_dim, seq]) and restored by a Transpose before SDPA.
+TEST(KVCacheCompressionPassRegressionTest, IntactSDPAIsRewired) {
+    const Shape key_shape{1, 4, 8, 16};
+    const Shape value_shape{1, 4, 16, 8};
     auto query = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
-    auto past_key = std::make_shared<op::v0::Parameter>(element::f32, kv_shape);
+    auto past_key = std::make_shared<op::v0::Parameter>(element::f32, key_shape);
     past_key->set_friendly_name("past_key_values.0.key");
     past_key->output(0).set_names({"past_key_values.0.key"});
-    auto past_value = std::make_shared<op::v0::Parameter>(element::f32, kv_shape);
+    auto past_value = std::make_shared<op::v0::Parameter>(element::f32, value_shape);
     past_value->set_friendly_name("past_key_values.0.value");
     past_value->output(0).set_names({"past_key_values.0.value"});
     auto new_key = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
-    auto new_value = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 1, 16});
+    auto new_value = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 4, 16, 1});
     auto mask = std::make_shared<op::v0::Parameter>(element::f32, Shape{1, 1, 1, 9});
     auto key = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
-    auto value = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 2);
-    auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key, value, mask, false);
+    auto value = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 3);
+    auto value_restore =
+        std::make_shared<op::v1::Transpose>(value,
+                                            op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2}));
+    auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query, key, value_restore, mask, false);
     auto model = std::make_shared<Model>(
         ResultVector{std::make_shared<op::v0::Result>(sdpa),
                      std::make_shared<op::v0::Result>(key),
@@ -331,8 +341,31 @@ TEST(KVCacheCompressionPassRegressionTest, IntactSDPAIsNotRewired) {
     ov::npuw::KVCacheCompressionParams params;
     params.key = {QuantizationType::Asymmetric, element::i8};
     params.value = {QuantizationType::Symmetric, element::i8};
-    ASSERT_NO_THROW(ov::npuw::run_kv_cache_dynamic_quantization_passes(model, params, false));
-    EXPECT_EQ(model->get_parameters().size(), params_before);
+    ASSERT_NO_THROW(ov::npuw::run_kv_cache_dynamic_quantization_passes(model, params, true));
+
+    // Key scale + key zp + value scale
+    EXPECT_EQ(model->get_parameters().size(), params_before + 3);
+    std::map<std::string, PartialShape> added;
+    for (const auto& input : model->inputs()) {
+        if (!input.get_names().empty()) {
+            added[input.get_any_name()] = input.get_partial_shape();
+        }
+    }
+    const auto expect_shape = [&added](const std::string& suffix, const PartialShape& expected) {
+        const auto it = std::find_if(added.begin(), added.end(), [&suffix](const auto& entry) {
+            return entry.first.find(suffix) != std::string::npos;
+        });
+        ASSERT_NE(it, added.end()) << "Missing input: " << suffix;
+        EXPECT_EQ(it->second, expected) << suffix;
+    };
+    expect_shape("/past_key_values/key/scale", PartialShape{1, 4, 8, 1});
+    expect_shape("/past_key_values/key/zp", PartialShape{1, 4, 8, 1});
+    // Transposed V: head_dim is axis 2
+    expect_shape("/past_key_values/value/scale", PartialShape{1, 4, 1, 8});
+
+    // The past caches reach the SDPA Concats only through the dequantizing Multiply
+    EXPECT_TRUE(ov::is_type<op::v1::Multiply>(key->get_input_node_shared_ptr(0)));
+    EXPECT_TRUE(ov::is_type<op::v1::Multiply>(value->get_input_node_shared_ptr(0)));
 }
 
 // The pass must inject exactly (num_sdpa * 2 * added_per_cache) new Parameters
