@@ -88,7 +88,8 @@ protected:
             {opp::any_input(), opp::any_input(), v, opp::any_input()});
         auto sdpa_scale = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
             {opp::any_input(), opp::any_input(), v, opp::any_input(), opp::any_input()});
-        return std::make_shared<opp::op::Or>(ov::OutputVector{matmul, sdpa, sdpa_scale});
+        using ov::pass::operator|;
+        return matmul | sdpa | sdpa_scale;
     }
 
     // generic part of matchers, to transpose v-tensors, and concat, and update matmul args
