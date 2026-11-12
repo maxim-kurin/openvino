@@ -274,7 +274,8 @@ std::shared_ptr<ov::Model> build_kept_sdpa_model(size_t num_layers = 1,
                                                  size_t num_kv_heads = 4,
                                                  size_t head_dim = 16,
                                                  size_t query_len = 8,
-                                                 size_t past_len = 8) {
+                                                 size_t past_len = 8,
+                                                 bool with_scale = true) {
     using namespace ov;
 
     const size_t context_len = past_len + query_len;
@@ -352,13 +353,23 @@ std::shared_ptr<ov::Model> build_kept_sdpa_model(size_t num_layers = 1,
         value_restore->set_friendly_name("sdpa." + idx + "/vt_restore");
         value_for_sdpa = value_restore->output(0);
 
-        auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
-        auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query,
-                                                                         key_for_sdpa,
-                                                                         value_for_sdpa,
-                                                                         mask,
-                                                                         scale,
-                                                                         false);
+        std::shared_ptr<op::v13::ScaledDotProductAttention> sdpa;
+        if (with_scale) {
+            auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
+            sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query,
+                                                                        key_for_sdpa,
+                                                                        value_for_sdpa,
+                                                                        mask,
+                                                                        scale,
+                                                                        false);
+        } else {
+            // No scale input, as exported for scale=None
+            sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query,
+                                                                        key_for_sdpa,
+                                                                        value_for_sdpa,
+                                                                        mask,
+                                                                        false);
+        }
         sdpa->set_friendly_name("sdpa." + idx);
 
         auto transpose = std::make_shared<op::v1::Transpose>(
@@ -496,6 +507,19 @@ TEST(SDPAPatternMatcherTest, ATTNPresetMatchesKeptSDPAModel) {
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
 
     EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u);
+}
+
+TEST(SDPAPatternMatcherTest, SDPAMatchesKeptSDPAWithoutScaleInput) {
+    auto model = build_kept_sdpa_model(/*num_layers=*/2, /*with_gqa=*/true, 8, 2, 16, 8, 8, /*with_scale=*/false);
+    for (const auto& op : model->get_ordered_ops()) {
+        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
+            ASSERT_EQ(op->get_input_size(), 4u);
+        }
+    }
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "ATTN"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u) << "A 4-input SDPA (no scale input) must be isolated too";
 }
 
 // Past KV Parameter -> Convert chains must land in the ATTN group, so that PYRAMID/HFA see the

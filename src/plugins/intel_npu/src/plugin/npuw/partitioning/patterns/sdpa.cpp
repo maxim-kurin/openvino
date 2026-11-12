@@ -13,6 +13,7 @@
 #include "openvino/op/ops.hpp"
 #include "openvino/pass/pattern/op/label.hpp"  // any_input
 #include "openvino/pass/pattern/op/optional.hpp"
+#include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "openvino/util/common_util.hpp"
 
@@ -110,8 +111,13 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
     // Transpose restoring the transposed V-cache layout when SDPA is kept (NPUW_LLM_DECOMPOSE_SDPA=NO)
     auto opt_trans_v = opp::optional<ov::op::v1::Transpose>({opt_rshp_v->output(0), opp::any_input()});
 
-    auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
+    // SDPA with an explicit scale input or without one (the default 1/sqrt(head_dim) scale)
+    using ov::pass::operator|;
+    auto sdpa_no_scale = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
+        {opp::any_input(), opt_rshp_k, opt_trans_v, opp::any_input()});
+    auto sdpa_scale = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
         {opp::any_input(), opt_rshp_k, opt_trans_v, opp::any_input(), opp::any_input()});
+    auto sdpa = sdpa_no_scale | sdpa_scale;
     auto trans = opp::wrap_type<ov::op::v1::Transpose>({sdpa, opp::any_input()});
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({trans, opp::any_input()});
 
@@ -135,7 +141,8 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                                                                     opt_bcast_v,
                                                                     opt_rshp_v,
                                                                     opt_trans_v,
-                                                                    sdpa,
+                                                                    sdpa_no_scale,
+                                                                    sdpa_scale,
                                                                     trans,
                                                                     reshape};
         for (auto&& pattern_node : pattern_nodes) {
