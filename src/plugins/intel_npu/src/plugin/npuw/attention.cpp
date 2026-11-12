@@ -63,12 +63,8 @@ void ov::npuw::function::patch_reshape_constants(const std::shared_ptr<ov::Model
             continue;
         }
 
-        auto patch_input = [&](const std::shared_ptr<ov::Node>& node, size_t sequence_axis) {
-            const auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
-            if (!matmul) {
-                return;
-            }
-            auto current = matmul->input_value(1).get_node_shared_ptr();
+        auto patch_input = [&](const ov::Input<ov::Node>& input, size_t sequence_axis) {
+            auto current = input.get_source_output().get_node_shared_ptr();
             while (current && !ov::is_type<ov::op::v1::Reshape>(current)) {
                 if (!ov::is_type<ov::op::v1::Transpose>(current) && !ov::is_type<ov::op::v0::Convert>(current) &&
                     !ov::is_type<ov::op::v1::Multiply>(current)) {
@@ -103,8 +99,8 @@ void ov::npuw::function::patch_reshape_constants(const std::shared_ptr<ov::Model
             reshape->input(1).replace_source_output(new_const);
         };
 
-        patch_input(pattern.matmul1_node, key_sequence_dim);
-        patch_input(pattern.matmul2_node, value_sequence_dim);
+        patch_input(pattern.key_input(), key_sequence_dim);
+        patch_input(pattern.value_input(), value_sequence_dim);
     }
 }
 

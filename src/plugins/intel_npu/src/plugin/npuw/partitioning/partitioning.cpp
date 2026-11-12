@@ -2114,12 +2114,12 @@ void Partitioner::attention(const std::string& func_name) {
         bool mask_kind_consistent = true;
         for (const auto& mdl : all_functions.at(func_name).mdls) {
             const auto pattern_nodes = ov::npuw::util::find_sdpa_pattern_nodes(mdl);
-            if (!pattern_nodes.add_node) {
+            if (!pattern_nodes.mask_rt_node()) {
                 continue;
             }
 
             int64_t mask_value = std::numeric_limits<int64_t>::min();
-            const auto& rt_info = pattern_nodes.add_node->get_rt_info();
+            const auto& rt_info = pattern_nodes.mask_rt_node()->get_rt_info();
             if (auto it = rt_info.find(ov::npuw::NPUW_SDPA_MASK_RT_KEY); it != rt_info.end()) {
                 mask_value = it->second.as<int64_t>();
             }

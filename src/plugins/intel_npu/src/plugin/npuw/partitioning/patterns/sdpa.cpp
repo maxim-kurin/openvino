@@ -107,9 +107,11 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
     auto opt_unsq_v = opp::optional<ov::op::v0::Unsqueeze>({past_v_cat->output(0), opp::any_input()});
     auto opt_bcast_v = opp::optional<ov::op::v3::Broadcast>({opt_unsq_v->output(0), opp::any_input()});
     auto opt_rshp_v = opp::optional<ov::op::v1::Reshape>({opt_bcast_v->output(0), opp::any_input()});
+    // Transpose restoring the transposed V-cache layout when SDPA is kept (NPUW_LLM_DECOMPOSE_SDPA=NO)
+    auto opt_trans_v = opp::optional<ov::op::v1::Transpose>({opt_rshp_v->output(0), opp::any_input()});
 
     auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
-        {opp::any_input(), opt_rshp_k, opt_rshp_v, opp::any_input(), opp::any_input()});
+        {opp::any_input(), opt_rshp_k, opt_trans_v, opp::any_input(), opp::any_input()});
     auto trans = opp::wrap_type<ov::op::v1::Transpose>({sdpa, opp::any_input()});
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({trans, opp::any_input()});
 
@@ -132,6 +134,7 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                                                                     opt_unsq_v,
                                                                     opt_bcast_v,
                                                                     opt_rshp_v,
+                                                                    opt_trans_v,
                                                                     sdpa,
                                                                     trans,
                                                                     reshape};

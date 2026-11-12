@@ -26,7 +26,9 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/softmax.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/openvino.hpp"
 #include "serialization.hpp"
@@ -159,6 +161,108 @@ std::shared_ptr<ov::Model> build_reshaped_attention_model(size_t query_len, size
     auto softmax = std::make_shared<op::v8::Softmax>(add, 3);
     auto attention = std::make_shared<op::v0::MatMul>(softmax, value_reshape, false, true);
     auto model = std::make_shared<Model>(ResultVector{std::make_shared<op::v0::Result>(attention)},
+                                         ParameterVector{query, past_key, new_key, past_value, new_value, mask});
+    model->validate_nodes_and_infer_types();
+    return model;
+}
+
+// Kept-SDPA counterpart of build_isolated_attention_model (NPUW_LLM_DECOMPOSE_SDPA=NO): the V-cache is
+// stored transposed ([1, H, head_dim, seq], concat axis 3) and an explicit Transpose restores the
+// [1, H, seq, head_dim] layout SDPA expects.
+std::shared_ptr<ov::Model> build_isolated_kept_sdpa_model(const AttentionModelConfig& cfg) {
+    using namespace ov;
+
+    const size_t context_len = cfg.past_len + cfg.query_len;
+    const Shape new_token_shape = {1, cfg.num_heads, cfg.query_len, cfg.head_dim};
+
+    auto query = ov::test::utils::make_param(element::f32, new_token_shape, "query.0");
+    auto past_key = ov::test::utils::make_param(element::f32,
+                                                Shape{1, cfg.num_heads, cfg.past_len, cfg.head_dim},
+                                                "past_key_values.0.key");
+    auto past_value = ov::test::utils::make_param(element::f32,
+                                                  Shape{1, cfg.num_heads, cfg.head_dim, cfg.past_len},
+                                                  "past_key_values.0.value");
+    auto new_key = ov::test::utils::make_param(element::f32, new_token_shape, "new_key.0");
+    auto new_value =
+        ov::test::utils::make_param(element::f32, Shape{1, cfg.num_heads, cfg.head_dim, cfg.query_len}, "new_value.0");
+    auto mask = ov::test::utils::make_param(element::f32, Shape{1, 1, cfg.query_len, context_len}, "mask.0");
+
+    auto key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
+    auto value_concat = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 3);
+    auto order = op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2});
+    auto value_restore = std::make_shared<op::v1::Transpose>(value_concat, order);
+    auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
+    auto sdpa =
+        std::make_shared<op::v13::ScaledDotProductAttention>(query, key_concat, value_restore, mask, scale, false);
+    sdpa->set_friendly_name("sdpa.0");
+
+    ResultVector results;
+    auto make_result = [&](const ov::Output<ov::Node>& out, const std::string& name) {
+        auto r = std::make_shared<op::v0::Result>(out);
+        r->set_friendly_name(name);
+        r->output(0).get_tensor().set_names({name});
+        results.push_back(r);
+    };
+    make_result(key_concat->output(0), "present.0.key");
+    make_result(value_concat->output(0), "present.0.value");
+    make_result(sdpa->output(0), "attn_out.0");
+
+    auto model = std::make_shared<Model>(results,
+                                         ParameterVector{query, past_key, past_value, new_key, new_value, mask},
+                                         "isolated_kept_sdpa_model");
+    model->validate_nodes_and_infer_types();
+    return model;
+}
+
+// Kept-SDPA counterpart of build_reshaped_attention_model: GQA with a transposed V-cache (V Concat axis 3),
+// the V broadcast chain works on the transposed layout and a Transpose restores it right before SDPA.
+std::shared_ptr<ov::Model> build_reshaped_kept_sdpa_model(size_t query_len, size_t past_len, size_t head_dim) {
+    using namespace ov;
+    const size_t context_len = query_len + past_len;
+    auto query = ov::test::utils::make_param(element::f32, Shape{1, 8, query_len, head_dim}, "query.0");
+    auto past_key = ov::test::utils::make_param(element::f32, Shape{1, 2, past_len, head_dim}, "past_key_values.0.key");
+    auto new_key = ov::test::utils::make_param(element::f32, Shape{1, 2, query_len, head_dim}, "new_key.0");
+    auto past_value =
+        ov::test::utils::make_param(element::f32, Shape{1, 2, head_dim, past_len}, "past_key_values.0.value");
+    auto new_value = ov::test::utils::make_param(element::f32, Shape{1, 2, head_dim, query_len}, "new_value.0");
+    auto mask = ov::test::utils::make_param(element::f32, Shape{1, 1, query_len, context_len}, "mask.0");
+
+    auto key_concat = std::make_shared<op::v0::Concat>(OutputVector{past_key, new_key}, 2);
+    auto value_concat = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 3);
+    auto axis = op::v0::Constant::create(element::i64, Shape{1}, {2});
+    auto key_unsqueeze = std::make_shared<op::v0::Unsqueeze>(key_concat, axis);
+    auto value_unsqueeze = std::make_shared<op::v0::Unsqueeze>(value_concat, axis);
+    auto broadcast_shape = op::v0::Constant::create(
+        element::i64,
+        Shape{5},
+        std::vector<int64_t>{1, 2, 4, static_cast<int64_t>(context_len), static_cast<int64_t>(head_dim)});
+    auto key_broadcast =
+        std::make_shared<op::v3::Broadcast>(key_unsqueeze, broadcast_shape, op::BroadcastType::BIDIRECTIONAL);
+    auto value_broadcast_shape = op::v0::Constant::create(
+        element::i64,
+        Shape{5},
+        std::vector<int64_t>{1, 2, 4, static_cast<int64_t>(head_dim), static_cast<int64_t>(context_len)});
+    auto value_broadcast =
+        std::make_shared<op::v3::Broadcast>(value_unsqueeze, value_broadcast_shape, op::BroadcastType::BIDIRECTIONAL);
+    auto kv_shape = op::v0::Constant::create(
+        element::i64,
+        Shape{4},
+        std::vector<int64_t>{1, 8, static_cast<int64_t>(context_len), static_cast<int64_t>(head_dim)});
+    auto value_shape = op::v0::Constant::create(
+        element::i64,
+        Shape{4},
+        std::vector<int64_t>{1, 8, static_cast<int64_t>(head_dim), static_cast<int64_t>(context_len)});
+    auto key_reshape = std::make_shared<op::v1::Reshape>(key_broadcast, kv_shape, false);
+    auto value_reshape = std::make_shared<op::v1::Reshape>(value_broadcast, value_shape, false);
+    key_reshape->set_friendly_name("key_reshape");
+    value_reshape->set_friendly_name("value_reshape");
+
+    auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
+    auto order = op::v0::Constant::create(element::i32, Shape{4}, {0, 1, 3, 2});
+    auto value_restore = std::make_shared<op::v1::Transpose>(value_reshape, order);
+    auto sdpa =
+        std::make_shared<op::v13::ScaledDotProductAttention>(query, key_reshape, value_restore, mask, scale, false);
+    auto model = std::make_shared<Model>(ResultVector{std::make_shared<op::v0::Result>(sdpa)},
                                          ParameterVector{query, past_key, new_key, past_value, new_value, mask});
     model->validate_nodes_and_infer_types();
     return model;
@@ -1061,6 +1165,84 @@ TEST(PyramidAttentionTest, ProcessBlockModePyramidModelsProducesGrowingContextLe
 //   export: orc::serialize(Stream::writer, PyramidAttentionContiguous)
 //   import: make_pyramid_from_stream(Stream::reader, tag)  <- same call as attn_subgraph.cpp:1185
 //   attach models, then call validate_port_indices() <- same call added to attn_subgraph.cpp
+
+// --- Kept SDPA (NPUW_LLM_DECOMPOSE_SDPA=NO) ---
+
+TEST(PyramidAttentionTest, KeptSDPAValidateReportsTransposedValueSequenceDim) {
+    AttentionModelConfig cfg;
+    cfg.query_len = 128;
+    cfg.past_len = 384;
+    auto validation = ov::npuw::function::validate_and_setup_pyramid_attention(build_isolated_kept_sdpa_model(cfg));
+    ASSERT_TRUE(validation.has_value());
+    const auto& info = get_contiguous_result(*validation);
+    EXPECT_EQ(info.query_length, 128u);
+    EXPECT_EQ(info.full_context_length, 512u);
+    EXPECT_EQ(info.past_key_sequence_dims.at("past_key_values.0.key"), 2u);
+    EXPECT_EQ(info.past_value_sequence_dims.at("past_key_values.0.value"), 3u);
+}
+
+TEST(PyramidAttentionTest, KeptSDPAFromKeepsSDPAInEveryPyramidModel) {
+    AttentionModelConfig cfg;
+    cfg.query_len = 1;
+    cfg.past_len = 2047;  // context = 2048, step = 1024 -> 2 models
+    auto pyramid = ov::npuw::function::PyramidAttention::from(build_isolated_kept_sdpa_model(cfg));
+
+    ASSERT_TRUE(pyramid.has_value());
+    EXPECT_TRUE(pyramid->is_valid());
+    EXPECT_EQ(pyramid->_query_length, 1u);
+    EXPECT_EQ(pyramid->_full_context_length, 2048u);
+    ASSERT_EQ(pyramid->num_models(), 2u);
+    for (size_t i = 0; i < pyramid->_models.size(); ++i) {
+        const auto& model = pyramid->_models[i];
+        const size_t context = (i + 1) * 1024;
+        size_t sdpa_count = 0;
+        for (const auto& op : model->get_ordered_ops()) {
+            if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
+                EXPECT_EQ(op->get_input_shape(2), (ov::Shape{1, cfg.num_heads, context, cfg.head_dim}));
+                ++sdpa_count;
+            }
+        }
+        EXPECT_EQ(sdpa_count, 1u) << "pyramid model " << i;
+        EXPECT_EQ(pyramid->_attentions[i]._mask_shape, (ov::Shape{1, 1, 1, context})) << "pyramid model " << i;
+    }
+}
+
+TEST(PyramidAttentionTest, KeptSDPAPrefillSpecializesRestoredValueReshapeSequenceAxis) {
+    for (const auto& [query_len, past_len] : {std::pair<size_t, size_t>{64, 128}, {128, 128}}) {
+        const size_t full_context = query_len + past_len;
+        SCOPED_TRACE("full context: " + std::to_string(full_context));
+        // head_dim == full context, so patching the wrong (V-cache) axis would be caught
+        auto model = build_reshaped_kept_sdpa_model(query_len, past_len, full_context);
+        auto validation = ov::npuw::function::validate_and_setup_pyramid_attention(model);
+        ASSERT_TRUE(validation.has_value());
+        const auto& info = get_contiguous_result(*validation);
+
+        auto variant = ov::npuw::function::process_pyramid_model(model,
+                                                                 0,
+                                                                 query_len,
+                                                                 info.query_length,
+                                                                 info.past_kv_length,
+                                                                 info.full_context_length,
+                                                                 info.past_key_sequence_dims,
+                                                                 info.past_value_sequence_dims);
+        ASSERT_TRUE(variant.has_value());
+        EXPECT_EQ(variant->model->output(0).get_shape(), (ov::Shape{1, 8, query_len, full_context}));
+        size_t patched_reshapes = 0;
+        for (const auto& op : variant->model->get_ordered_ops()) {
+            auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(op);
+            if (reshape && reshape->get_friendly_name() == "key_reshape") {
+                EXPECT_EQ(reshape->get_output_shape(0), (ov::Shape{1, 8, query_len, full_context}));
+                ++patched_reshapes;
+            }
+            if (reshape && reshape->get_friendly_name() == "value_reshape") {
+                // V Reshape keeps the transposed [.., head_dim, seq] layout
+                EXPECT_EQ(reshape->get_output_shape(0), (ov::Shape{1, 8, full_context, query_len}));
+                ++patched_reshapes;
+            }
+        }
+        EXPECT_EQ(patched_reshapes, 2u);
+    }
+}
 
 namespace {
 

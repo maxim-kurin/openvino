@@ -261,6 +261,132 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_dq_model(size_t num_layers = 1,
     return model;
 }
 
+
+// Build a model with intact ScaledDotProductAttention as left by NPUW_LLM_DECOMPOSE_SDPA=NO:
+// the V-cache is stored transposed ([1, kv_heads, head_dim, seq], concat axis 3), the GQA chain works on
+// that layout and an explicit Transpose{0,1,3,2} right before SDPA restores the layout SDPA expects.
+//   past_key(f16)   → Convert → Concat(new_key, axis 2)   → [opt:Unsqueeze→Broadcast→Reshape]             → SDPA.K
+//   past_value(f16) → Convert → Concat(new_value, axis 3) → [opt:Unsqueeze→Broadcast→Reshape] → Transpose → SDPA.V
+//   SDPA(query, K, V, mask, scale) → Transpose → Reshape → Result
+std::shared_ptr<ov::Model> build_kept_sdpa_model(size_t num_layers = 1,
+                                                 bool with_gqa = false,
+                                                 size_t num_heads = 4,
+                                                 size_t num_kv_heads = 4,
+                                                 size_t head_dim = 16,
+                                                 size_t query_len = 8,
+                                                 size_t past_len = 8) {
+    using namespace ov;
+
+    const size_t context_len = past_len + query_len;
+    const Shape query_shape = {1, num_heads, query_len, head_dim};
+
+    ParameterVector params;
+    ResultVector results;
+
+    for (size_t n = 0; n < num_layers; ++n) {
+        const std::string idx = std::to_string(n);
+        auto query = ov::test::utils::make_param(element::f32, query_shape, "query." + idx);
+        params.push_back(query);
+
+        auto make_kv_concat =
+            [&](const std::string& kv, const Shape& past_shape, const Shape& new_shape, int64_t axis) {
+                const std::string name = "past_key_values." + idx + "." + kv;
+                auto past = ov::test::utils::make_param(element::f16, past_shape, name);
+                params.push_back(past);
+                auto cvt = std::make_shared<op::v0::Convert>(past, element::f32);
+                cvt->set_friendly_name("convert_" + name);
+                auto present = ov::test::utils::make_param(element::f32, new_shape, "new_" + kv + "." + idx);
+                params.push_back(present);
+                auto concat = std::make_shared<op::v0::Concat>(OutputVector{cvt, present}, axis);
+                concat->set_friendly_name("concat_" + kv + "." + idx);
+                return concat;
+            };
+        auto key_concat = make_kv_concat("key",
+                                         Shape{1, num_kv_heads, past_len, head_dim},
+                                         Shape{1, num_kv_heads, query_len, head_dim},
+                                         2);
+        auto value_concat = make_kv_concat("value",
+                                           Shape{1, num_kv_heads, head_dim, past_len},
+                                           Shape{1, num_kv_heads, head_dim, query_len},
+                                           3);
+
+        auto mask = ov::test::utils::make_param(element::f32, Shape{1, 1, query_len, context_len}, "mask." + idx);
+        params.push_back(mask);
+
+        Output<Node> key_for_sdpa = key_concat->output(0);
+        Output<Node> value_for_sdpa = value_concat->output(0);
+        if (with_gqa && num_kv_heads < num_heads) {
+            const size_t groups = num_heads / num_kv_heads;
+            // V is expanded on the transposed [.., head_dim, seq] layout
+            auto expand_gqa = [&](Output<Node> input, bool transposed) -> Output<Node> {
+                auto seq = static_cast<int64_t>(context_len);
+                auto dim = static_cast<int64_t>(head_dim);
+                if (transposed) {
+                    std::swap(seq, dim);
+                }
+                auto unsq =
+                    std::make_shared<op::v0::Unsqueeze>(input, op::v0::Constant::create(element::i64, Shape{1}, {2}));
+                auto bcast = std::make_shared<op::v3::Broadcast>(
+                    unsq,
+                    op::v0::Constant::create(element::i64,
+                                             Shape{5},
+                                             std::vector<int64_t>{1,
+                                                                  static_cast<int64_t>(num_kv_heads),
+                                                                  static_cast<int64_t>(groups),
+                                                                  seq,
+                                                                  dim}));
+                auto rshp = std::make_shared<op::v1::Reshape>(
+                    bcast,
+                    op::v0::Constant::create(element::i64,
+                                             Shape{4},
+                                             std::vector<int64_t>{1, static_cast<int64_t>(num_heads), seq, dim}),
+                    false);
+                return rshp->output(0);
+            };
+            key_for_sdpa = expand_gqa(key_for_sdpa, false);
+            value_for_sdpa = expand_gqa(value_for_sdpa, true);
+        }
+        auto value_restore = std::make_shared<op::v1::Transpose>(
+            value_for_sdpa,
+            op::v0::Constant::create(element::i32, Shape{4}, std::vector<int32_t>{0, 1, 3, 2}));
+        value_restore->set_friendly_name("sdpa." + idx + "/vt_restore");
+        value_for_sdpa = value_restore->output(0);
+
+        auto scale = op::v0::Constant::create(element::f32, Shape{}, {0.25f});
+        auto sdpa = std::make_shared<op::v13::ScaledDotProductAttention>(query,
+                                                                         key_for_sdpa,
+                                                                         value_for_sdpa,
+                                                                         mask,
+                                                                         scale,
+                                                                         false);
+        sdpa->set_friendly_name("sdpa." + idx);
+
+        auto transpose = std::make_shared<op::v1::Transpose>(
+            sdpa,
+            op::v0::Constant::create(element::i64, Shape{4}, std::vector<int64_t>{0, 2, 1, 3}));
+        auto reshape = std::make_shared<op::v1::Reshape>(
+            transpose,
+            op::v0::Constant::create(
+                element::i64,
+                Shape{3},
+                std::vector<int64_t>{1, static_cast<int64_t>(query_len), static_cast<int64_t>(num_heads * head_dim)}),
+            false);
+
+        auto make_result = [&](const Output<Node>& out, const std::string& name) {
+            auto r = std::make_shared<op::v0::Result>(out);
+            r->set_friendly_name(name);
+            results.push_back(r);
+        };
+        make_result(key_concat->output(0), "present." + idx + ".key");
+        make_result(value_concat->output(0), "present." + idx + ".value");
+        make_result(reshape->output(0), "attn_out." + idx);
+    }
+
+    auto model = std::make_shared<Model>(results, params, "kept_sdpa_model");
+    model->validate_nodes_and_infer_types();
+    return model;
+}
+
 }  // namespace
 
 // --- SDPADecomposed matcher tests ---
@@ -342,4 +468,59 @@ TEST(SDPAPatternMatcherTest, ATTNPresetMatchesDQModel) {
 
     EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u)
         << "ATTN preset should match DQ SDPA model via SDPACompressed pattern";
+}
+
+// --- SDPA (intact op) matcher tests, NPUW_LLM_DECOMPOSE_SDPA=NO layout ---
+
+TEST(SDPAPatternMatcherTest, SDPAMatchesKeptSDPAWithRestoredVCache) {
+    auto model = build_kept_sdpa_model(/*num_layers=*/4);
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "P:SDPA/attn"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    const auto attn_count = count_groups_with_tag(ens, "attn");
+    EXPECT_GE(attn_count, 4u) << "SDPA should match all 4 attention layers through the V-restore Transpose, got "
+                              << attn_count;
+}
+
+TEST(SDPAPatternMatcherTest, SDPAMatchesKeptGQASDPAWithRestoredVCache) {
+    auto model = build_kept_sdpa_model(/*num_layers=*/2, /*with_gqa=*/true, 8, 2);
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "P:SDPA/attn"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u);
+}
+
+TEST(SDPAPatternMatcherTest, ATTNPresetMatchesKeptSDPAModel) {
+    auto model = build_kept_sdpa_model(/*num_layers=*/2);
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "ATTN"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u);
+}
+
+// Past KV Parameter -> Convert chains must land in the ATTN group, so that PYRAMID/HFA see the
+// past_key_values Parameters in the attention function.
+static void expect_past_kv_converts_in_attn(const std::shared_ptr<ov::Model>& model, const ov::npuw::Ensemble& ens) {
+    size_t converts = 0;
+    for (const auto& op : model->get_ordered_ops()) {
+        if (!ov::is_type<ov::op::v0::Convert>(op) ||
+            op->get_friendly_name().find("convert_past_key_values") == std::string::npos) {
+            continue;
+        }
+        ++converts;
+        const auto group_iter = std::find_if(ens.groups.begin(), ens.groups.end(), [&](const ov::npuw::Group& group) {
+            return std::find(group.all_layers.begin(), group.all_layers.end(), op->get_friendly_name()) !=
+                   group.all_layers.end();
+        });
+        ASSERT_NE(group_iter, ens.groups.end()) << op->get_friendly_name();
+        EXPECT_EQ(group_iter->gettag(), "attn") << op->get_friendly_name();
+    }
+    EXPECT_GT(converts, 0u);
+}
+
+TEST(SDPAPatternMatcherTest, SDPAIsolatesPastKVConverts) {
+    auto model = build_kept_sdpa_model(/*num_layers=*/2, /*with_gqa=*/true, 8, 2);
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "ATTN"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+    expect_past_kv_converts_in_attn(model, ens);
 }

@@ -28,6 +28,7 @@ namespace pass {
  * own partition, creating conflicting assignments.
  *
  * This pass duplicates the [Convert →] Concat → [Unsqueeze] → [Broadcast] → Reshape
+ * (→ [Transpose] restoring the transposed V-cache when SDPA is kept intact)
  * chain for every extra consumer beyond the first, giving each SDPA its own
  * local chain:
  *

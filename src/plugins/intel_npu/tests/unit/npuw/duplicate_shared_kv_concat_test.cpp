@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <numeric>
 #include <set>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
@@ -42,11 +44,14 @@ size_t count_ops(const std::shared_ptr<ov::Model>& model) {
 //   [Convert →] Concat(kv_param, current_k) → [Unsqueeze → Broadcast] → Reshape
 //                                                                          └─ fan_out Results
 // with_gqa=true inserts the Unsqueeze + Broadcast (GQA head-expansion) chain.
+// with_v_restore=true inserts a Transpose that restores a transposed V-cache right after the Reshape,
+// shared by all consumers as SharedOpOptimization leaves it (NPUW_LLM_DECOMPOSE_SDPA=NO).
 std::shared_ptr<ov::Model> build_fanout_model(const std::string& kv_param_name,
                                               const ov::Shape& kv_shape,
                                               int64_t concat_axis,
                                               size_t fan_out,
-                                              bool with_gqa = false) {
+                                              bool with_gqa = false,
+                                              bool with_v_restore = false) {
     auto kv = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, kv_shape);
     kv->set_friendly_name(kv_param_name);
 
@@ -78,13 +83,21 @@ std::shared_ptr<ov::Model> build_fanout_model(const std::string& kv_param_name,
     auto reshape = std::make_shared<ov::op::v1::Reshape>(data, shape_const(reshape_target), false);
 
     // Use MatMul as consumers so the consumer-type guard in try_match() is satisfied.
-    const size_t head_dim = reshape_target.back();
+    const size_t head_dim = with_v_restore ? reshape_target[reshape_target.size() - 2] : reshape_target.back();
     auto matmul_weight = ov::op::v0::Constant::create(ov::element::f16,
                                                       ov::Shape{head_dim, head_dim},
                                                       std::vector<float>(head_dim * head_dim, 1.0f));
     ov::ResultVector results;
+    ov::Output<ov::Node> mm_input = reshape->output(0);
+    if (with_v_restore) {
+        std::vector<int64_t> order_values(reshape_target.size());
+        std::iota(order_values.begin(), order_values.end(), 0);
+        std::swap(order_values[order_values.size() - 1], order_values[order_values.size() - 2]);
+        auto order = ov::op::v0::Constant::create(ov::element::i64, {order_values.size()}, order_values);
+        mm_input = std::make_shared<ov::op::v1::Transpose>(mm_input, order)->output(0);
+    }
     for (size_t i = 0; i < fan_out; ++i) {
-        auto mm = std::make_shared<ov::op::v0::MatMul>(reshape, matmul_weight);
+        auto mm = std::make_shared<ov::op::v0::MatMul>(mm_input, matmul_weight);
         results.push_back(std::make_shared<ov::op::v0::Result>(mm));
     }
 
@@ -191,6 +204,38 @@ TEST_F(DuplicateSharedKVConcatTest, GQA_FanOut3) {
     for (const auto& r : model->get_results())
         reshapes.insert(r->get_input_node_ptr(0)->get_input_node_ptr(0));  // skip MatMul
     EXPECT_EQ(reshapes.size(), 3u);
+}
+
+// ─── GQA with a restored transposed V-cache (NPUW_LLM_DECOMPOSE_SDPA=NO) ─────
+
+TEST_F(DuplicateSharedKVConcatTest, GQA_VRestoreTranspose_FanOut3) {
+    // V-cache [1, 2, head_dim=8, seq=4], concat on axis 3
+    auto model = build_fanout_model("past_key_values.0.value",
+                                    {1, 2, 8, 4},
+                                    3,
+                                    /*fan_out=*/3,
+                                    /*with_gqa=*/true,
+                                    /*with_v_restore=*/true);
+
+    EXPECT_TRUE(run_pass(model));
+
+    EXPECT_EQ(count_ops<ov::op::v0::Concat>(model), 3u);
+    EXPECT_EQ(count_ops<ov::op::v1::Transpose>(model), 3u);
+    EXPECT_EQ(count_ops<ov::op::v0::Unsqueeze>(model), 3u);
+    EXPECT_EQ(count_ops<ov::op::v3::Broadcast>(model), 3u);
+
+    // Each consumer gets its own Concat -> Unsqueeze -> Broadcast -> Reshape -> Transpose chain
+    std::set<ov::Node*> concats;
+    for (const auto& r : model->get_results()) {
+        auto* node = r->get_input_node_ptr(0)->get_input_node_ptr(0);  // skip MatMul
+        ASSERT_TRUE(ov::is_type<ov::op::v1::Transpose>(node));
+        node = node->get_input_node_ptr(0);
+        ASSERT_TRUE(ov::is_type<ov::op::v1::Reshape>(node));
+        node = node->get_input_node_ptr(0)->get_input_node_ptr(0)->get_input_node_ptr(0);
+        ASSERT_TRUE(ov::is_type<ov::op::v0::Concat>(node));
+        concats.insert(node);
+    }
+    EXPECT_EQ(concats.size(), 3u);
 }
 
 // ─── Integration: SplitKVCacheIntoBlocks → DuplicateSharedKVConcat ───────────

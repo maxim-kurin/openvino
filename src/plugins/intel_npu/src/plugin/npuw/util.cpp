@@ -30,6 +30,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
@@ -1419,7 +1420,7 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
         }
     }
 
-    // Helper lambda to trace from MatMul to find Concat node
+    // Helper lambda to trace from MatMul (or SDPA) to find Concat node
     auto find_concat_from_matmul = [](const std::shared_ptr<ov::Node>& matmul_node,
                                       size_t input_idx) -> std::shared_ptr<ov::Node> {
         if (!matmul_node)
@@ -1451,11 +1452,36 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
         return nullptr;
     };
 
+    // Helper lambda to store a found pattern; returns false when the search should stop
+    auto add_candidate = [&](ov::npuw::util::SDPAPatternNodes& candidate) {
+        // Attach the model-level KV param nodes collected above.
+        candidate.past_key_param_nodes = all_past_key_params;
+        candidate.past_value_param_nodes = all_past_value_params;
+
+        // pattern might be not full, say missed concats for example
+        candidate.log_pattern(std::to_string(pattern_nodes.size()));
+
+        pattern_nodes.push_back(candidate);
+        return findAll;
+    };
+
     LOG_DEBUG("Entering find_sdpa_pattern_nodes_internal");
     LOG_BLOCK();
-    // Search for the pattern: MatMul -> Add -> Softmax -> MatMul
+    // Search for the pattern: MatMul -> Add -> Softmax -> MatMul, or an intact SDPA
     auto ops = model->get_ordered_ops();
     for (auto&& node : ops) {
+        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(node)) {
+            // SDPA kept intact (NPUW_LLM_DECOMPOSE_SDPA=NO): K/V are SDPA inputs 1/2
+            LOG_DEBUG("Examining node: " << node->get_friendly_name() << " (" << node->get_type_name() << ")");
+            ov::npuw::util::SDPAPatternNodes candidate;
+            candidate.sdpa_node = node;
+            candidate.past_key_concat_node = find_concat_from_matmul(node, 1);
+            candidate.past_value_concat_node = find_concat_from_matmul(node, 2);
+            if (!add_candidate(candidate)) {
+                break;
+            }
+            continue;
+        }
         if (!ov::is_type<ov::op::v8::Softmax>(node))
             continue;
         LOG_DEBUG("Examining node: " << node->get_friendly_name() << " (" << node->get_type_name() << ")");
@@ -1503,15 +1529,7 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
             continue;
         }
 
-        // Attach the model-level KV param nodes collected above.
-        candidate.past_key_param_nodes = all_past_key_params;
-        candidate.past_value_param_nodes = all_past_value_params;
-
-        // pattern might be not full, say missed concats for example
-        current_node.log_pattern(std::to_string(pattern_nodes.size()));
-
-        pattern_nodes.push_back(candidate);
-        if (!findAll) {
+        if (!add_candidate(candidate)) {
             break;
         }
     }
@@ -1533,16 +1551,54 @@ ov::npuw::util::SDPAPatternNodes ov::npuw::util::find_sdpa_pattern_nodes(const s
     return internal_nodes.front();
 }
 
-std::shared_ptr<ov::op::v0::Parameter> ov::npuw::util::find_mask_parameter(const std::shared_ptr<ov::Node>& add_node) {
-    if (!add_node || add_node->get_input_size() < 2) {
-        return nullptr;
+std::shared_ptr<ov::Node> ov::npuw::util::SDPAPatternNodes::query_node() const {
+    if (sdpa_node) {
+        return sdpa_node->get_input_node_shared_ptr(0);
     }
-    // Traverse the Add node's mask input (input 1) upwards to find the Parameter.
+    return matmul1_node ? matmul1_node->get_input_node_shared_ptr(0) : nullptr;
+}
+
+std::shared_ptr<ov::Node> ov::npuw::util::SDPAPatternNodes::mask_node() const {
+    if (sdpa_node) {
+        // Only an explicit additive mask: a causal flag or a boolean mask is applied implicitly by SDPA
+        const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(sdpa_node);
+        if (sdpa->get_causal() || sdpa->get_input_size() < 4 ||
+            sdpa->get_input_element_type(3) == ov::element::boolean) {
+            return nullptr;
+        }
+        return sdpa->get_input_node_shared_ptr(3);
+    }
+    return add_node && add_node->get_input_size() > 1 ? add_node->get_input_node_shared_ptr(1) : nullptr;
+}
+
+ov::Input<ov::Node> ov::npuw::util::SDPAPatternNodes::key_input() const {
+    return sdpa_node ? sdpa_node->input(1) : matmul1_node->input(1);
+}
+
+ov::Input<ov::Node> ov::npuw::util::SDPAPatternNodes::value_input() const {
+    return sdpa_node ? sdpa_node->input(2) : matmul2_node->input(1);
+}
+
+ov::PartialShape ov::npuw::util::SDPAPatternNodes::scores_shape() const {
+    if (!sdpa_node) {
+        return softmax_node ? softmax_node->get_output_partial_shape(0) : ov::PartialShape::dynamic();
+    }
+    // SDPA Q is [..., query_len, head_dim], K is [..., context_len, head_dim]
+    const auto& q_shape = sdpa_node->get_input_partial_shape(0);
+    const auto& k_shape = sdpa_node->get_input_partial_shape(1);
+    if (q_shape.rank().is_dynamic() || k_shape.rank().is_dynamic() || q_shape.size() < 2 || k_shape.size() < 2) {
+        return ov::PartialShape::dynamic();
+    }
+    return ov::PartialShape{q_shape[q_shape.size() - 2], k_shape[k_shape.size() - 2]};
+}
+
+std::shared_ptr<ov::op::v0::Parameter> ov::npuw::util::find_mask_parameter(const std::shared_ptr<ov::Node>& mask_node) {
+    // Traverse the mask input upwards to find the Parameter.
     // Only unary ops are allowed along the way.
-    auto mask_in_node = add_node->input(1).get_source_output().get_node_shared_ptr();
+    auto mask_in_node = mask_node;
     while (mask_in_node && !ov::op::util::is_parameter(mask_in_node)) {
         if (mask_in_node->inputs().size() != 1) {
-            LOG_WARN("Non-unary or disconnected op on the way from Add to input mask");
+            LOG_WARN("Non-unary or disconnected op on the way to input mask");
             return nullptr;
         }
         mask_in_node = mask_in_node->inputs()[0].get_source_output().get_node_shared_ptr();
