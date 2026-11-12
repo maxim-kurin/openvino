@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "npuw_transformations/convert_kvcache_to_precision.hpp"
+#include "npuw_transformations/optimize_value_tensors.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/broadcast.hpp"
 #include "openvino/op/concat.hpp"
@@ -20,6 +22,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
@@ -260,6 +263,74 @@ TEST_F(DuplicateSharedKVConcatTest, NoOp_VRestoreReshapeWithExtraConsumer) {
     EXPECT_FALSE(run_pass(model));
     EXPECT_EQ(count_ops<ov::op::v0::Concat>(model), 1u);
     EXPECT_EQ(count_ops<ov::op::v1::Transpose>(model), 1u);
+}
+
+// ─── Integration: OptimizeValueTensors(keep SDPA) → PPP → DuplicateSharedKVConcat ─
+// OptimizeValueTensors inserts one V-restore Transpose per SDPA. The pass expects them merged into one,
+// which SharedOpOptimization does in the PrePostProcessor build() of ConvertKVCacheToPrecision (run on
+// the prefill model before DuplicateSharedKVConcat in LLMCompiledModel).
+
+TEST_F(DuplicateSharedKVConcatTest, Integration_KeepSDPAThenPPPThenDuplicate) {
+    constexpr int64_t B = 1, KV = 1, QH = 8, S = 8, N = 4, D = 16;
+    auto past_value = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, KV, S, D});
+    past_value->set_friendly_name("past_key_values.0.value");
+    past_value->output(0).set_names({"past_key_values.0.value"});
+    // MQA: the frontend turns the [B, N, 1, D] -> [B, 1, N, D] transpose of the new V into a Reshape
+    auto new_v = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, N, KV, D});
+    auto new_v_t = std::make_shared<ov::op::v1::Reshape>(
+        new_v,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{B, KV, N, D}),
+        false);
+    auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_value, new_v_t}, 2);
+    auto unsqueeze =
+        std::make_shared<ov::op::v0::Unsqueeze>(concat, ov::op::v0::Constant::create(ov::element::i64, {1}, {2}));
+    auto broadcast = std::make_shared<ov::op::v3::Broadcast>(
+        unsqueeze,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5}, std::vector<int64_t>{B, KV, QH, S + N, D}),
+        ov::op::BroadcastType::BIDIRECTIONAL);
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(
+        broadcast,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{B, QH, S + N, D}),
+        false);
+
+    ov::ParameterVector params{past_value, new_v};
+    auto present = std::make_shared<ov::op::v0::Result>(concat);
+    present->output(0).set_names({"present.0.value"});
+    ov::ResultVector results{present};
+    std::vector<std::shared_ptr<ov::Node>> sdpas;
+    for (int i = 0; i < 2; ++i) {
+        auto q = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, QH, N, D});
+        auto k = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, QH, S + N, D});
+        auto mask = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{B, 1, N, S + N});
+        auto scale = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {1.0f});
+        auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, reshape, mask, scale, false);
+        params.insert(params.end(), {q, k, mask});
+        results.push_back(std::make_shared<ov::op::v0::Result>(sdpa));
+        sdpas.push_back(sdpa);
+    }
+    auto model = std::make_shared<ov::Model>(results, params);
+
+    ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(true, false, /*decompose_sdpa=*/false).run_on_model(model));
+    // The new V Reshape becomes a Transpose too
+    ASSERT_EQ(count_ops<ov::op::v1::Transpose>(model), 3u) << "One V-restore Transpose per SDPA is expected";
+
+    ov::npuw::ConvertKVCacheToPrecision(ov::element::f16, /*v_tensors_transposed=*/true).run_on_model(model);
+    ASSERT_EQ(count_ops<ov::op::v1::Transpose>(model), 2u) << "PPP must merge the V-restore Transposes";
+
+    EXPECT_TRUE(run_pass(model));
+
+    // Each SDPA gets its own Concat -> Unsqueeze -> Broadcast -> Reshape -> Transpose chain
+    std::set<ov::Node*> concats;
+    for (const auto& sdpa : sdpas) {
+        auto* node = sdpa->get_input_node_ptr(2);
+        ASSERT_TRUE(ov::is_type<ov::op::v1::Transpose>(node));
+        node = node->get_input_node_ptr(0);
+        ASSERT_TRUE(ov::is_type<ov::op::v1::Reshape>(node));
+        node = node->get_input_node_ptr(0)->get_input_node_ptr(0)->get_input_node_ptr(0);
+        ASSERT_TRUE(ov::is_type<ov::op::v0::Concat>(node));
+        concats.insert(node);
+    }
+    EXPECT_EQ(concats.size(), 2u);
 }
 
 // ─── Integration: SplitKVCacheIntoBlocks → DuplicateSharedKVConcat ───────────
